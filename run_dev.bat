@@ -1,0 +1,3 @@
+@echo off
+echo Starting ISP Fault Management Platform...
+npm run dev

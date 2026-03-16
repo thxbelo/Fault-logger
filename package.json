@@ -1,0 +1,14 @@
+{
+  "name": "fault-logger-enterprise",
+  "version": "1.0.0",
+  "description": "ISP Fault Management Platform",
+  "scripts": {
+    "install:all": "npm install && cd frontend && npm install && cd ../backend && .\\venv\\Scripts\\python.exe -m pip install -r requirements.txt",
+    "dev": "concurrently --kill-others \"npm run server\" \"npm run client\"",
+    "server": "cd backend && .\\venv\\Scripts\\python.exe -m uvicorn main:app --reload --host 127.0.0.1 --port 8000",
+    "client": "cd frontend && npm run dev"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
