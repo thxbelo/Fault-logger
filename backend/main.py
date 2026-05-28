@@ -452,33 +452,182 @@ def _build_chart_data(db: Session) -> dict:
 def get_chart_data(db: Session = Depends(database.get_db)):
     return _build_chart_data(db)
 
-# Speed Test
+# Speed Test — uses Cloudflare's public speed endpoint (no external library needed)
 @app.get("/speedtest", response_model=schemas.SpeedTestResult)
 async def run_speedtest(current_user: models.User = Depends(get_current_user)):
-    """Run a live internet speed test."""
-    import speedtest
-    
-    def _test():
-        st = speedtest.Speedtest()
-        st.get_best_server()
-        st.download()
-        st.upload()
-        return st.results.dict()
+    """Measure real internet speed via Cloudflare's public speed-test API."""
+    import urllib.request, time, random, ssl
+
+    CLOUDFLARE = "https://speed.cloudflare.com"
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    def _measure_ping(url: str, attempts: int = 5) -> float:
+        times = []
+        for _ in range(attempts):
+            try:
+                t0 = time.perf_counter()
+                req = urllib.request.Request(url + "/", method="HEAD")
+                req.add_header("User-Agent", "Mozilla/5.0")
+                urllib.request.urlopen(req, timeout=5, context=ctx)
+                times.append((time.perf_counter() - t0) * 1000)
+            except Exception:
+                pass
+        return round(min(times) if times else 999, 2)
+
+    def _measure_download(bytes_count: int = 10_000_000) -> float:
+        url = f"{CLOUDFLARE}/__down?bytes={bytes_count}"
+        req = urllib.request.Request(url)
+        req.add_header("User-Agent", "Mozilla/5.0")
+        req.add_header("Accept-Encoding", "identity")
+        t0 = time.perf_counter()
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+            data = resp.read()
+        elapsed = time.perf_counter() - t0
+        return round((len(data) * 8) / elapsed / 1_000_000, 2)  # Mbps
+
+    def _measure_upload(bytes_count: int = 4_000_000) -> float:
+        payload = random.randbytes(bytes_count)
+        url = f"{CLOUDFLARE}/__up"
+        req = urllib.request.Request(url, data=payload, method="POST")
+        req.add_header("User-Agent", "Mozilla/5.0")
+        req.add_header("Content-Type", "application/octet-stream")
+        req.add_header("Content-Length", str(len(payload)))
+        t0 = time.perf_counter()
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+            resp.read()
+        elapsed = time.perf_counter() - t0
+        return round((bytes_count * 8) / elapsed / 1_000_000, 2)  # Mbps
+
+    def _run_all():
+        print("Starting Ping measurement...")
+        ping = _measure_ping(CLOUDFLARE)
+        print(f"Ping: {ping} ms. Starting Download measurement...")
+        download = _measure_download()
+        print(f"Download: {download} Mbps. Starting Upload measurement...")
+        upload = _measure_upload()
+        print(f"Upload: {upload} Mbps. Speed test complete.")
+        return {"ping": ping, "download": download, "upload": upload}
 
     loop = asyncio.get_event_loop()
     try:
-        # Run synchronous speedtest in a separate thread to avoid blocking
-        res = await loop.run_in_executor(None, _test)
+        result = await asyncio.wait_for(
+            loop.run_in_executor(None, _run_all),
+            timeout=60.0
+        )
         return {
-            "download": round(res["download"] / 1_000_000, 2),
-            "upload": round(res["upload"] / 1_000_000, 2),
-            "ping": round(res["ping"], 2),
-            "server": f"{res['server']['name']}, {res['server']['country']}",
+            "download": result["download"],
+            "upload": result["upload"],
+            "ping": result["ping"],
+            "server": "Cloudflare Speed Test (Global CDN)",
             "timestamp": datetime.now()
         }
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Speed test timed out. Please check your connection and try again.")
     except Exception as e:
         print(f"Speedtest failed: {e}")
-        raise HTTPException(status_code=500, detail="Internet speed test failed. Please try again later.")
+        raise HTTPException(status_code=500, detail=f"Speed test error: {str(e)}")
+
+
+# Rich Analytics Endpoint
+@app.get("/analytics/")
+def get_analytics(db: Session = Depends(database.get_db), current_user: models.User = Depends(get_current_user)):
+    """Rich analytics data for the dashboard charts."""
+    print(f"Generating analytics for user: {current_user.username}")
+    all_faults = db.query(models.FaultLog).all()
+    total = len(all_faults)
+    resolved = [f for f in all_faults if f.status == "Resolved"]
+    open_faults = [f for f in all_faults if f.status == "Open"]
+    critical = [f for f in all_faults if f.severity == "Critical"]
+    sla_breaches = [f for f in all_faults if f.is_sla_breach]
+
+    # Resolution times
+    resolve_times = []
+    for f in resolved:
+        if f.resolved_at and f.created_at:
+            mins = (f.resolved_at - f.created_at).total_seconds() / 60
+            if mins >= 0:
+                resolve_times.append(mins)
+    avg_resolve_min = round(sum(resolve_times) / len(resolve_times), 1) if resolve_times else 0
+
+    # Daily trend — last 30 days
+    today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    daily_trend = []
+    for i in range(29, -1, -1):
+        day = today - timedelta(days=i)
+        day_end = day + timedelta(days=1)
+        count = sum(1 for f in all_faults if f.created_at and day <= f.created_at < day_end)
+        resolved_count = sum(1 for f in resolved if f.resolved_at and day <= f.resolved_at < day_end)
+        daily_trend.append({
+            "date": day.strftime("%d %b"),
+            "faults": count,
+            "resolved": resolved_count
+        })
+
+    # By ISP
+    all_isps = ["Powertel", "Starlink"]
+    isp_data = []
+    for isp in all_isps:
+        isp_faults = [f for f in all_faults if f.isp_name == isp]
+        isp_resolved = [f for f in isp_faults if f.status == "Resolved"]
+        isp_critical = [f for f in isp_faults if f.severity == "Critical"]
+        rate = round(len(isp_resolved) / len(isp_faults) * 100, 1) if isp_faults else 0
+        isp_data.append({
+            "name": isp,
+            "total": len(isp_faults),
+            "resolved": len(isp_resolved),
+            "open": len(isp_faults) - len(isp_resolved),
+            "critical": len(isp_critical),
+            "resolution_rate": rate
+        })
+
+    # By severity
+    severities = ["Minor", "Major", "Critical"]
+    severity_colors = {"Minor": "#7FBFB3", "Major": "#C6A75C", "Critical": "#C1121F"}
+    by_severity = [
+        {"name": s, "value": sum(1 for f in all_faults if f.severity == s), "color": severity_colors[s]}
+        for s in severities
+    ]
+
+    # By fault type
+    fault_types = {}
+    for f in all_faults:
+        if f.fault_type:
+            fault_types[f.fault_type] = fault_types.get(f.fault_type, 0) + 1
+    type_colors = ["#7FBFB3", "#C6A75C", "#C1121F", "#1E3A8A", "#64748b", "#a855f7"]
+    by_type = sorted(
+        [{"name": k, "value": v, "color": type_colors[i % len(type_colors)]} for i, (k, v) in enumerate(fault_types.items())],
+        key=lambda x: x["value"], reverse=True
+    )
+
+    # By location
+    locations = {}
+    for f in all_faults:
+        if f.location:
+            locations[f.location] = locations.get(f.location, 0) + 1
+    by_location = sorted(
+        [{"name": k, "value": v} for k, v in locations.items()],
+        key=lambda x: x["value"], reverse=True
+    )[:8]
+
+    return {
+        "summary": {
+            "total": total,
+            "resolved": len(resolved),
+            "open": len(open_faults),
+            "critical": len(critical),
+            "sla_breaches": len(sla_breaches),
+            "resolution_rate": round(len(resolved) / total * 100, 1) if total else 0,
+            "avg_resolve_min": avg_resolve_min
+        },
+        "daily_trend": daily_trend,
+        "by_isp": isp_data,
+        "by_severity": by_severity,
+        "by_type": by_type[:6],
+        "by_location": by_location
+    }
+
 
 # WebSockets
 @app.websocket("/ws")

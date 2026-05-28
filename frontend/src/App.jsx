@@ -30,6 +30,10 @@ import {
   Eye,
   Zap
 } from 'lucide-react';
+import {
+  AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
+  XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer
+} from 'recharts';
 
 const App = () => {
   const [token, setToken] = useState(localStorage.getItem('token'));
@@ -54,10 +58,15 @@ const App = () => {
     if (token) {
       fetchLogs();
       fetchStats();
-      setupWebSocket();
     }
-    return () => ws.current?.close();
   }, [period, token]);
+
+  useEffect(() => {
+    if (token) {
+      setupWebSocket();
+      return () => ws.current?.close();
+    }
+  }, [token]);
 
   const setupWebSocket = () => {
     ws.current = new WebSocket(`ws://${window.location.host}/api/ws`);
@@ -285,10 +294,10 @@ const App = () => {
         )}
         {activeTab === 'active' && <ActiveFaultsView logs={logs} formatDate={formatDate} handleResolve={handleResolve} />}
         {activeTab === 'history' && <FaultLogsView logs={logs} formatDate={formatDate} setSelectedLogId={setSelectedLogId} setShowDeleteModal={setShowDeleteModal} setActiveTab={setActiveTab} />}
-        {activeTab === 'analytics' && <AnalyticsView token={token} />}
+        {activeTab === 'analytics' && <AnalyticsView token={token} logout={logout} />}
         {activeTab === 'reports' && <ReportsView />}
         {activeTab === 'email' && <AlertsView token={token} logout={logout} />}
-        {activeTab === 'speed-test' && <SpeedTestView token={token} />}
+        {activeTab === 'speed-test' && <SpeedTestView token={token} logout={logout} />}
         {activeTab === 'log-incident' && (
           <LogIncidentView 
             newFault={newFault} 
@@ -531,148 +540,215 @@ const Sidebar = ({ activeTab, setActiveTab, user, logout }) => (
   </div>
 );
 
-const AnalyticsView = ({ token }) => {
-  const fmtPct = (n, digits = 1) => `${(Number.isFinite(n) ? n : 0).toFixed(digits)}%`;
-  const fmtInt = (n) => (Number.isFinite(n) ? Math.round(n).toLocaleString() : '0');
-  const startOfDayUtc = (d) => new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
-  const addDaysUtc = (d, days) => new Date(d.getTime() + days * 24 * 60 * 60 * 1000);
-  const dayKeyUtc = (d) => startOfDayUtc(d).toISOString().slice(0, 10);
-
-  const buildDailySeries = (faults, daysBack, predicate) => {
-    const end = startOfDayUtc(new Date());
-    const start = addDaysUtc(end, -(daysBack - 1));
-    const bins = new Map();
-    for (let i = 0; i < daysBack; i++) bins.set(dayKeyUtc(addDaysUtc(start, i)), 0);
-    for (const f of faults) {
-      const created = new Date(f.created_at);
-      if (Number.isNaN(created.getTime())) continue;
-      const k = dayKeyUtc(created);
-      if (!bins.has(k)) continue;
-      if (predicate && !predicate(f)) continue;
-      bins.set(k, (bins.get(k) || 0) + 1);
-    }
-    return Array.from(bins.values());
-  };
-
-  const topN = (arr, n = 5) => arr.slice().sort((a, b) => b.value - a.value).slice(0, n);
-
-  const Sparkline = ({ a = [], b = [], height = 86 }) => {
-    const w = 260;
-    const h = height;
-    const pad = 6;
-    const all = [...a, ...b].filter((v) => Number.isFinite(v));
-    const min = all.length ? Math.min(...all) : 0;
-    const max = all.length ? Math.max(...all) : 1;
-    const scaleX = (i, n) => pad + (n <= 1 ? 0 : (i / (n - 1)) * (w - pad * 2));
-    const scaleY = (v) => {
-      if (max === min) return h / 2;
-      const t = (v - min) / (max - min);
-      return pad + (1 - t) * (h - pad * 2);
-    };
-    const pathFor = (arr) => {
-      if (!arr.length) return '';
-      return arr.map((v, idx) => `${idx === 0 ? 'M' : 'L'} ${scaleX(idx, arr.length).toFixed(2)} ${scaleY(v).toFixed(2)}`).join(' ');
-    };
-    return (
-      <svg className="kpi-spark" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" aria-hidden="true">
-        <path d={`M ${pad} ${h - pad} L ${w - pad} ${h - pad}`} stroke="rgba(255,255,255,0.06)" strokeWidth="1" />
-        <path d={pathFor(a)} fill="none" stroke="rgba(127,191,179,0.22)" strokeWidth="10" opacity="0.6" />
-        <path d={pathFor(b)} fill="none" stroke="rgba(198,167,92,0.18)" strokeWidth="10" opacity="0.55" />
-        <path d={pathFor(b)} fill="none" stroke="rgba(198,167,92,0.9)" strokeWidth="2" />
-        <path d={pathFor(a)} fill="none" stroke="rgba(127,191,179,0.95)" strokeWidth="2.2" />
-      </svg>
-    );
-  };
-
-  const Gauge = ({ value = 0 }) => {
-    const v = Math.max(0, Math.min(100, Number(value) || 0));
-    const r = 44;
-    const c = 2 * Math.PI * r;
-    const offset = c * (1 - v / 100);
-    return (
-      <div className="kpi-gauge">
-        <svg viewBox="0 0 120 120" width="120" height="120" aria-hidden="true">
-          <defs>
-            <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-              <stop offset="0%" stopColor="rgba(127,191,179,1)" />
-              <stop offset="55%" stopColor="rgba(198,167,92,1)" />
-              <stop offset="100%" stopColor="rgba(193,18,31,1)" />
-            </linearGradient>
-          </defs>
-          <circle cx="60" cy="60" r={r} stroke="rgba(255,255,255,0.08)" strokeWidth="10" fill="none" />
-          <circle cx="60" cy="60" r={r} stroke="url(#g)" strokeWidth="10" fill="none" strokeLinecap="round" strokeDasharray={c} strokeDashoffset={offset} transform="rotate(-90 60 60)" />
-          <circle cx="60" cy="60" r="2.5" fill="rgba(255,255,255,0.35)" />
-        </svg>
-        <div className="kpi-gaugeValue">{v.toFixed(1)}%</div>
-      </div>
-    );
-  };
-
-  const StatRow = ({ label, value }) => (
-    <div className="kpi-row">
-      <span className="kpi-rowLabel">{label}</span>
-      <span className="kpi-rowValue">{value}</span>
-    </div>
-  );
-
+const AnalyticsView = ({ token, logout }) => {
   const [loading, setLoading] = useState(true);
-  const [payload, setPayload] = useState(null);
+  const [data, setData] = useState(null);
 
   useEffect(() => {
     let mounted = true;
-    Promise.all([
-      fetch('/api/chart-data/', { headers: { 'Authorization': `Bearer ${token}` } }).then(r => r.json()),
-      fetch('/api/faults/?period=all', { headers: { 'Authorization': `Bearer ${token}` } }).then(r => r.json()),
-    ]).then(([chartData, faults]) => {
-      if (!mounted) return;
-      const allFaults = Array.isArray(faults) ? faults : [];
-      const series50 = buildDailySeries(allFaults, 50);
-      setPayload({
-        isps: (chartData?.isps || []),
-        last7: {
-          total: allFaults.length,
-          resolved: allFaults.filter(f => f.status === 'Resolved').length,
-          critical: allFaults.filter(f => f.severity === 'Critical').length,
-          resolutionRate: allFaults.length ? (allFaults.filter(f => f.status === 'Resolved').length / allFaults.length) * 100 : 0,
-          breachRate: allFaults.length ? (allFaults.filter(f => !!f.is_sla_breach).length / allFaults.length) * 100 : 0,
-          avgResolveMin: 0,
-          locationsAffected: new Set(allFaults.map(f => f.location)).size
-        },
-        series: {
-          faultsCurr25: series50.slice(25),
-          faultsPrev25: series50.slice(0, 25),
-          critCurr25: buildDailySeries(allFaults, 25, f => f.severity === 'Critical'),
-          critPrev25: []
-        },
-        by: { location: [], type: [], isp: [] }
-      });
-      setLoading(false);
-    }).catch(() => setLoading(false));
+    fetch('/api/analytics/', { headers: { 'Authorization': `Bearer ${token}` } })
+      .then(r => { if (r.status === 401) { logout(); return null; } return r.json(); })
+      .then(d => { if (mounted && d) { setData(d); setLoading(false); } })
+      .catch(() => { if (mounted) setLoading(false); });
     return () => { mounted = false; };
   }, [token]);
 
+  const TOOLTIP_STYLE = {
+    contentStyle: { background: 'rgba(15,23,42,0.95)', border: '1px solid rgba(198,167,92,0.3)', borderRadius: '12px', color: '#f8fafc', fontSize: '12px' },
+    labelStyle: { color: '#94a3b8', fontWeight: 700, fontSize: '11px', textTransform: 'uppercase' },
+    cursor: { fill: 'rgba(255,255,255,0.04)' }
+  };
+
+  const KpiCard = ({ label, value, sub, color = '#7FBFB3' }) => (
+    <div className="glass-card p-6 flex flex-col gap-2" style={{ borderTop: `3px solid ${color}` }}>
+      <p style={{ fontSize: '10px', fontWeight: 900, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#94a3b8' }}>{label}</p>
+      <p style={{ fontSize: '42px', fontWeight: 900, color: '#f8fafc', lineHeight: 1, letterSpacing: '-0.03em' }}>{value}</p>
+      {sub && <p style={{ fontSize: '11px', color: '#64748b', fontWeight: 700 }}>{sub}</p>}
+    </div>
+  );
+
+  if (loading) return (
+    <div className="space-y-8 animate-in fade-in duration-500">
+      <div><h2 className="text-3xl font-black text-white uppercase tracking-tight">ISP Analytics</h2><p className="text-xs text-text-muted mt-1">Loading live data...</p></div>
+      <div className="glass-card p-20 flex items-center justify-center"><Activity size={32} className="text-accent-gold animate-spin" /></div>
+    </div>
+  );
+
+  if (!data) return (
+    <div className="space-y-8 animate-in fade-in duration-500">
+      <div><h2 className="text-3xl font-black text-white uppercase tracking-tight">ISP Analytics</h2></div>
+      <div className="glass-card p-12 text-center text-text-muted text-sm">Failed to load analytics. Please refresh.</div>
+    </div>
+  );
+
+  const { summary, daily_trend, by_isp, by_severity, by_type, by_location } = data;
+
   return (
-    <div className="space-y-8 animate-in fade-in duration-500 kpi-board">
+    <div className="space-y-8 animate-in fade-in duration-500">
+      {/* Header */}
       <div className="flex justify-between items-center">
         <div>
-          <h2 className="text-3xl font-black text-white uppercase tracking-tight">ISP Efficiency Analysis</h2>
-          <p className="text-xs text-text-muted mt-1">Live performance breakdown</p>
+          <h2 className="text-3xl font-black text-white uppercase tracking-tight">ISP Analytics</h2>
+          <p className="text-xs text-text-muted mt-1">30-day operational performance — Bulawayo City Council</p>
         </div>
       </div>
-      {loading || !payload ? <div className="glass-card p-8 text-sm text-text-muted">Loading analytics...</div> : (
-        <div className="kpi-grid">
-          <div className="kpi-card kpi-span-4">
-            <div className="kpi-head">
-              <div><div className="kpi-title">Faults</div><div className="kpi-value">{fmtInt(payload.last7.total)}</div></div>
-            </div>
-            <Sparkline a={payload.series.faultsCurr25} b={payload.series.faultsPrev25} />
-          </div>
-          <div className="kpi-card kpi-span-4">
-            <div className="kpi-head"><div><div className="kpi-title">Resolution rate</div><div className="kpi-value">{fmtPct(payload.last7.resolutionRate)}</div></div></div>
-            <div className="kpi-mini">Resolved: {fmtInt(payload.last7.resolved)}</div>
+
+      {/* KPI Row */}
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <KpiCard label="Total Faults" value={summary.total} sub="All time" color="#7FBFB3" />
+        <KpiCard label="Open Issues" value={summary.open} sub={`${summary.critical} critical`} color="#C1121F" />
+        <KpiCard label="Resolution Rate" value={`${summary.resolution_rate}%`} sub={`${summary.resolved} resolved`} color="#C6A75C" />
+        <KpiCard label="Avg Resolve Time" value={summary.avg_resolve_min > 0 ? `${summary.avg_resolve_min}m` : 'N/A'} sub={`${summary.sla_breaches} SLA breaches`} color="#1E3A8A" />
+      </div>
+
+      {/* 30-Day Trend */}
+      <div className="glass-card p-8" style={{ borderTop: '3px solid #C6A75C' }}>
+        <p style={{ fontSize: '11px', fontWeight: 900, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#94a3b8', marginBottom: '20px' }}>30-Day Fault Trend</p>
+        <ResponsiveContainer width="100%" height={220}>
+          <AreaChart data={daily_trend} margin={{ top: 5, right: 10, left: -20, bottom: 0 }}>
+            <defs>
+              <linearGradient id="faultsGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="5%" stopColor="#C1121F" stopOpacity={0.35} />
+                <stop offset="95%" stopColor="#C1121F" stopOpacity={0} />
+              </linearGradient>
+              <linearGradient id="resolvedGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="5%" stopColor="#7FBFB3" stopOpacity={0.35} />
+                <stop offset="95%" stopColor="#7FBFB3" stopOpacity={0} />
+              </linearGradient>
+            </defs>
+            <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
+            <XAxis dataKey="date" tick={{ fill: '#64748b', fontSize: 10, fontWeight: 700 }} tickLine={false} axisLine={false} interval={4} />
+            <YAxis tick={{ fill: '#64748b', fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
+            <Tooltip {...TOOLTIP_STYLE} />
+            <Legend wrapperStyle={{ fontSize: '11px', fontWeight: 800, color: '#94a3b8', paddingTop: '12px' }} />
+            <Area type="monotone" dataKey="faults" name="Faults" stroke="#C1121F" strokeWidth={2} fill="url(#faultsGrad)" dot={false} activeDot={{ r: 4, fill: '#C1121F' }} />
+            <Area type="monotone" dataKey="resolved" name="Resolved" stroke="#7FBFB3" strokeWidth={2} fill="url(#resolvedGrad)" dot={false} activeDot={{ r: 4, fill: '#7FBFB3' }} />
+          </AreaChart>
+        </ResponsiveContainer>
+      </div>
+
+      {/* ISP Comparison + Severity Donut */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div className="glass-card p-8 lg:col-span-2" style={{ borderTop: '3px solid #7FBFB3' }}>
+          <p style={{ fontSize: '11px', fontWeight: 900, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#94a3b8', marginBottom: '20px' }}>ISP Fault Comparison</p>
+          <ResponsiveContainer width="100%" height={220}>
+            <BarChart data={by_isp} margin={{ top: 0, right: 10, left: -20, bottom: 0 }} barGap={4}>
+              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
+              <XAxis dataKey="name" tick={{ fill: '#94a3b8', fontSize: 11, fontWeight: 800 }} tickLine={false} axisLine={false} />
+              <YAxis tick={{ fill: '#64748b', fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
+              <Tooltip {...TOOLTIP_STYLE} />
+              <Legend wrapperStyle={{ fontSize: '11px', fontWeight: 800, color: '#94a3b8', paddingTop: '12px' }} />
+              <Bar dataKey="total" name="Total" fill="#1E3A8A" radius={[4, 4, 0, 0]} />
+              <Bar dataKey="resolved" name="Resolved" fill="#7FBFB3" radius={[4, 4, 0, 0]} />
+              <Bar dataKey="critical" name="Critical" fill="#C1121F" radius={[4, 4, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div className="glass-card p-8" style={{ borderTop: '3px solid #C1121F' }}>
+          <p style={{ fontSize: '11px', fontWeight: 900, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#94a3b8', marginBottom: '4px' }}>Severity Breakdown</p>
+          <ResponsiveContainer width="100%" height={180}>
+            <PieChart>
+              <Pie data={by_severity} cx="50%" cy="50%" innerRadius={52} outerRadius={76} paddingAngle={3} dataKey="value" stroke="none">
+                {by_severity.map((entry, i) => <Cell key={i} fill={entry.color} />)}
+              </Pie>
+              <Tooltip {...TOOLTIP_STYLE} cursor={false} />
+            </PieChart>
+          </ResponsiveContainer>
+          <div className="flex flex-col gap-2 mt-2">
+            {by_severity.map((s, i) => (
+              <div key={i} className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <span style={{ width: 8, height: 8, borderRadius: '50%', background: s.color, display: 'inline-block' }}></span>
+                  <span style={{ fontSize: '11px', fontWeight: 800, color: '#94a3b8' }}>{s.name}</span>
+                </div>
+                <span style={{ fontSize: '13px', fontWeight: 900, color: '#f8fafc' }}>{s.value}</span>
+              </div>
+            ))}
           </div>
         </div>
-      )}
+      </div>
+
+      {/* Fault Type Donut + Location Table */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div className="glass-card p-8" style={{ borderTop: '3px solid #C6A75C' }}>
+          <p style={{ fontSize: '11px', fontWeight: 900, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#94a3b8', marginBottom: '4px' }}>Fault Type Distribution</p>
+          {by_type.length === 0 ? (
+            <div style={{ height: 180, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#475569', fontSize: '12px', fontWeight: 700 }}>No data yet</div>
+          ) : (
+            <>
+              <ResponsiveContainer width="100%" height={180}>
+                <PieChart>
+                  <Pie data={by_type} cx="50%" cy="50%" innerRadius={52} outerRadius={76} paddingAngle={3} dataKey="value" stroke="none">
+                    {by_type.map((entry, i) => <Cell key={i} fill={entry.color} />)}
+                  </Pie>
+                  <Tooltip {...TOOLTIP_STYLE} cursor={false} />
+                </PieChart>
+              </ResponsiveContainer>
+              <div className="flex flex-col gap-2 mt-2">
+                {by_type.slice(0, 4).map((t, i) => (
+                  <div key={i} className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <span style={{ width: 8, height: 8, borderRadius: '50%', background: t.color, display: 'inline-block' }}></span>
+                      <span style={{ fontSize: '11px', fontWeight: 800, color: '#94a3b8', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '160px' }}>{t.name}</span>
+                    </div>
+                    <span style={{ fontSize: '13px', fontWeight: 900, color: '#f8fafc' }}>{t.value}</span>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+
+        <div className="glass-card p-8" style={{ borderTop: '3px solid #7FBFB3' }}>
+          <p style={{ fontSize: '11px', fontWeight: 900, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#94a3b8', marginBottom: '16px' }}>Location Hotspots</p>
+          {by_location.length === 0 ? (
+            <div style={{ color: '#475569', fontSize: '12px', fontWeight: 700, textAlign: 'center', paddingTop: '60px' }}>No data yet</div>
+          ) : (
+            <div className="flex flex-col gap-1">
+              {by_location.map((loc, i) => {
+                const maxVal = by_location[0]?.value || 1;
+                const pct = Math.round((loc.value / maxVal) * 100);
+                return (
+                  <div key={i} style={{ padding: '10px 0', borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+                    <div className="flex justify-between items-center mb-1">
+                      <span style={{ fontSize: '12px', fontWeight: 800, color: '#e2e8f0' }}>{loc.name}</span>
+                      <span style={{ fontSize: '12px', fontWeight: 900, color: '#7FBFB3' }}>{loc.value}</span>
+                    </div>
+                    <div style={{ height: 4, background: 'rgba(255,255,255,0.06)', borderRadius: 4 }}>
+                      <div style={{ height: 4, width: `${pct}%`, background: 'linear-gradient(90deg,#7FBFB3,#C6A75C)', borderRadius: 4, transition: 'width 0.8s ease' }} />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ISP Leaderboard */}
+      <div className="glass-card p-8" style={{ borderTop: '3px solid #1E3A8A' }}>
+        <p style={{ fontSize: '11px', fontWeight: 900, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#94a3b8', marginBottom: '16px' }}>ISP Performance Leaderboard</p>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: '8px', paddingBottom: '8px', borderBottom: '1px solid rgba(255,255,255,0.08)', marginBottom: '8px' }}>
+          {['ISP', 'Total', 'Resolved', 'Critical', 'Resolution Rate'].map(h => (
+            <span key={h} style={{ fontSize: '10px', fontWeight: 900, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.1em' }}>{h}</span>
+          ))}
+        </div>
+        {by_isp.map((isp, i) => (
+          <div key={i} style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: '8px', padding: '12px 0', borderBottom: '1px solid rgba(255,255,255,0.04)', alignItems: 'center' }}>
+            <span style={{ fontSize: '13px', fontWeight: 900, color: '#f8fafc' }}>{isp.name}</span>
+            <span style={{ fontSize: '13px', fontWeight: 700, color: '#94a3b8' }}>{isp.total}</span>
+            <span style={{ fontSize: '13px', fontWeight: 700, color: '#7FBFB3' }}>{isp.resolved}</span>
+            <span style={{ fontSize: '13px', fontWeight: 700, color: '#C1121F' }}>{isp.critical}</span>
+            <div className="flex items-center gap-2">
+              <div style={{ flex: 1, height: 6, background: 'rgba(255,255,255,0.06)', borderRadius: 4 }}>
+                <div style={{ height: 6, width: `${isp.resolution_rate}%`, background: isp.resolution_rate >= 80 ? '#7FBFB3' : isp.resolution_rate >= 50 ? '#C6A75C' : '#C1121F', borderRadius: 4 }} />
+              </div>
+              <span style={{ fontSize: '11px', fontWeight: 900, color: '#f8fafc', minWidth: '36px' }}>{isp.resolution_rate}%</span>
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 };
@@ -1179,7 +1255,7 @@ const ReportsView = () => (
   </div>
 );
 
-const SpeedTestView = ({ token }) => {
+const SpeedTestView = ({ token, logout }) => {
   const [results, setResults] = useState(null);
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState('');
