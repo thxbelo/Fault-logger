@@ -1,1 +1,7 @@
 node_modules
+frontend/dist
+backend/venv
+backend/dev_runtime.db
+__pycache__/
+*.pyc
+.env

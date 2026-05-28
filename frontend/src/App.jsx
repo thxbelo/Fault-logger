@@ -28,12 +28,38 @@ import {
   X,
   ChevronDown,
   Eye,
-  Zap
+  Zap,
+  MessageSquare,
+  Send,
+  UserPlus,
+  Users
 } from 'lucide-react';
 import {
   AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
   XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer
 } from 'recharts';
+
+const STATUS_OPTIONS = ['Open', 'Assigned', 'Investigating', 'Waiting for ISP', 'Resolved', 'Closed'];
+const ACTIVE_STATUSES = ['Open', 'Assigned', 'Investigating', 'Waiting for ISP'];
+
+const getStatusClass = (status) => {
+  if (status === 'Resolved' || status === 'Closed') return 'status-resolved';
+  if (status === 'Investigating' || status === 'Waiting for ISP' || status === 'Assigned') return 'status-resolving';
+  return 'status-active';
+};
+
+const formatDuration = (start, end) => {
+  if (!start) return '-';
+  const startDate = new Date(start);
+  const endDate = end ? new Date(end) : new Date();
+  const totalMinutes = Math.max(0, Math.floor((endDate - startDate) / 60000));
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  return `${minutes}m`;
+};
 
 const App = () => {
   const [token, setToken] = useState(localStorage.getItem('token'));
@@ -43,11 +69,16 @@ const App = () => {
   const [period, setPeriod] = useState('all');
   const [notifications, setNotifications] = useState([]);
   const ws = useRef(null);
-  const [user, setUser] = useState({ username: 'Admin', role: 'Admin' });
+  const [user, setUser] = useState({ username: '', role: '' });
+  const [assignees, setAssignees] = useState([]);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [selectedLogId, setSelectedLogId] = useState(null);
   const [deletePassword, setDeletePassword] = useState('');
   const [deleteError, setDeleteError] = useState('');
+  const [showResolveModal, setShowResolveModal] = useState(false);
+  const [resolveLog, setResolveLog] = useState(null);
+  const [resolutionNote, setResolutionNote] = useState('');
+  const [resolveError, setResolveError] = useState('');
   const [selectedImage, setSelectedImage] = useState(null);
   const [imagePreview, setImagePreview] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -56,6 +87,8 @@ const App = () => {
 
   useEffect(() => {
     if (token) {
+      fetchMe();
+      fetchAssignees();
       fetchLogs();
       fetchStats();
     }
@@ -69,12 +102,20 @@ const App = () => {
   }, [token]);
 
   const setupWebSocket = () => {
-    ws.current = new WebSocket(`ws://${window.location.host}/api/ws`);
+    const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    const url = import.meta.env.DEV
+      ? `${protocol}://127.0.0.1:8080/ws`
+      : `${protocol}://${window.location.host}/api/ws`;
+
+    ws.current = new WebSocket(url);
     ws.current.onmessage = (event) => {
       const data = JSON.parse(event.data);
       setNotifications(prev => [data, ...prev].slice(0, 5));
       fetchLogs();
       fetchStats();
+    };
+    ws.current.onerror = (error) => {
+      console.error('WebSocket error:', error);
     };
   };
 
@@ -101,6 +142,30 @@ const App = () => {
       setStats(data);
     } catch (err) {
       console.error("Failed to fetch stats:", err);
+    }
+  };
+
+  const fetchMe = async () => {
+    try {
+      const res = await fetch('/api/users/me', {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (res.status === 401) return logout();
+      if (res.ok) setUser(await res.json());
+    } catch (err) {
+      console.error("Failed to fetch user:", err);
+    }
+  };
+
+  const fetchAssignees = async () => {
+    try {
+      const res = await fetch('/api/users/assignees', {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (res.status === 401) return logout();
+      if (res.ok) setAssignees(await res.json());
+    } catch (err) {
+      console.error("Failed to fetch assignees:", err);
     }
   };
 
@@ -152,12 +217,16 @@ const App = () => {
 
 
 
-  const [newFault, setNewFault] = useState({ isp_name: 'Powertel', location: 'City Hall', severity: 'Minor', fault_type: '', description: '' });
+  const [newFault, setNewFault] = useState({ isp_name: 'Powertel', location: 'City Hall', severity: 'Minor', fault_type: '', description: '', assigned_to: '' });
 
   const handleImageChange = (e) => {
     const file = e.target.files[0];
     if (file) {
       setSelectedImage(file);
+      if (!file.type.startsWith('image/')) {
+        setImagePreview(null);
+        return;
+      }
       const reader = new FileReader();
       reader.onloadend = () => {
         setImagePreview(reader.result);
@@ -192,7 +261,7 @@ const App = () => {
         }
 
         setActiveTab('dashboard');
-        setNewFault({ isp_name: 'Powertel', location: 'City Hall', severity: 'Minor', fault_type: '', description: '' });
+        setNewFault({ isp_name: 'Powertel', location: 'City Hall', severity: 'Minor', fault_type: '', description: '', assigned_to: '' });
         setSelectedImage(null);
         setImagePreview(null);
         fetchLogs();
@@ -209,20 +278,48 @@ const App = () => {
     }
   };
 
-  const handleResolve = async (id) => {
+  const handleUpdateFault = async (id, payload) => {
     try {
       const res = await fetch(`/api/faults/${id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-        body: JSON.stringify({ status: 'Resolved' })
+        body: JSON.stringify(payload)
       });
       if (res.status === 401) return logout();
       if (res.ok) {
+        const updated = await res.json();
         fetchLogs();
         fetchStats();
+        return updated;
       }
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(errData.detail || 'Failed to update fault');
     } catch (err) {
       console.error(err);
+      throw err;
+    }
+  };
+
+  const openResolveDialog = (log) => {
+    setResolveLog(log);
+    setResolutionNote(log?.resolution_note || '');
+    setResolveError('');
+    setShowResolveModal(true);
+  };
+
+  const handleResolveConfirm = async () => {
+    if (!resolutionNote.trim()) {
+      setResolveError('Resolution note is required.');
+      return;
+    }
+    try {
+      await handleUpdateFault(resolveLog.id, { status: 'Resolved', resolution_note: resolutionNote.trim() });
+      setShowResolveModal(false);
+      setResolveLog(null);
+      setResolutionNote('');
+      setResolveError('');
+    } catch (err) {
+      setResolveError(err.message || 'Failed to resolve fault');
     }
   };
 
@@ -292,11 +389,12 @@ const App = () => {
             notifications={notifications} 
           />
         )}
-        {activeTab === 'active' && <ActiveFaultsView logs={logs} formatDate={formatDate} handleResolve={handleResolve} />}
-        {activeTab === 'history' && <FaultLogsView logs={logs} formatDate={formatDate} setSelectedLogId={setSelectedLogId} setShowDeleteModal={setShowDeleteModal} setActiveTab={setActiveTab} />}
+        {activeTab === 'active' && <ActiveFaultsView logs={logs} formatDate={formatDate} onResolve={openResolveDialog} onUpdateFault={handleUpdateFault} assignees={assignees} />}
+        {activeTab === 'history' && <FaultLogsView logs={logs} formatDate={formatDate} setSelectedLogId={setSelectedLogId} setShowDeleteModal={setShowDeleteModal} setActiveTab={setActiveTab} token={token} logout={logout} onUpdateFault={handleUpdateFault} onResolve={openResolveDialog} assignees={assignees} refreshLogs={fetchLogs} />}
         {activeTab === 'analytics' && <AnalyticsView token={token} logout={logout} />}
         {activeTab === 'reports' && <ReportsView />}
         {activeTab === 'email' && <AlertsView token={token} logout={logout} />}
+        {activeTab === 'users' && <UsersView token={token} logout={logout} currentUser={user} />}
         {activeTab === 'speed-test' && <SpeedTestView token={token} logout={logout} />}
         {activeTab === 'log-incident' && (
           <LogIncidentView 
@@ -309,6 +407,7 @@ const App = () => {
             setActiveTab={setActiveTab} 
             submitError={submitError}
             isLoading={isLoading}
+            assignees={assignees}
           />
         )}
       </main>
@@ -372,6 +471,57 @@ const App = () => {
                   className="flex-1 premium-button-red py-3 text-xs"
                 >
                   DELETE PERMANENTLY
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showResolveModal && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-6">
+          <div className="absolute inset-0 bg-bg-dark/80 backdrop-blur-md" onClick={() => {
+            setShowResolveModal(false);
+            setResolveLog(null);
+            setResolutionNote('');
+            setResolveError('');
+          }}></div>
+          <div className="glass-card w-full max-w-md relative overflow-hidden flex flex-col border-t-4 border-t-accent-teal">
+            <div className="p-8 space-y-6">
+              <div className="flex flex-col items-center gap-4 text-center">
+                <div className="w-16 h-16 bg-accent-teal/10 rounded-full flex items-center justify-center text-accent-teal">
+                  <CheckCircle size={32} />
+                </div>
+                <div>
+                  <h3 className="text-2xl font-black uppercase text-white">Resolve Incident</h3>
+                  <p className="text-sm text-text-muted mt-2">Add a resolution note for <span className="text-accent-gold font-mono">{resolveLog?.ticket_number || `#${resolveLog?.id}`}</span>.</p>
+                </div>
+              </div>
+
+              <textarea
+                rows="5"
+                value={resolutionNote}
+                onChange={e => setResolutionNote(e.target.value)}
+                className="w-full bg-[#1e293b]/50 border border-white/20 rounded-lg p-3 text-white focus:border-accent-teal outline-none transition-all resize-none"
+                placeholder="e.g. ISP restored fiber connectivity."
+                autoFocus
+              />
+              {resolveError && <p className="text-accent-red text-[10px] font-bold text-center animate-shake">{resolveError}</p>}
+
+              <div className="flex gap-4">
+                <button
+                  onClick={() => {
+                    setShowResolveModal(false);
+                    setResolveLog(null);
+                    setResolutionNote('');
+                    setResolveError('');
+                  }}
+                  className="flex-1 py-3 font-bold border border-white/10 rounded-xl hover:bg-white/5 transition-colors text-white"
+                >
+                  CANCEL
+                </button>
+                <button onClick={handleResolveConfirm} className="flex-1 premium-button py-3 text-xs">
+                  MARK RESOLVED
                 </button>
               </div>
             </div>
@@ -521,6 +671,11 @@ const Sidebar = ({ activeTab, setActiveTab, user, logout }) => (
       <div className={`sidebar-item ${activeTab === 'email' ? 'active' : ''}`} onClick={() => setActiveTab('email')}>
         <Mail size={20} /> <span>Management Alerts</span>
       </div>
+      {user.role === 'Admin' && (
+        <div className={`sidebar-item ${activeTab === 'users' ? 'active' : ''}`} onClick={() => setActiveTab('users')}>
+          <Users size={20} /> <span>User Management</span>
+        </div>
+      )}
       <div className={`sidebar-item ${activeTab === 'speed-test' ? 'active' : ''}`} onClick={() => setActiveTab('speed-test')}>
         <Zap size={20} /> <span>Internet Speed Test</span>
       </div>
@@ -756,7 +911,13 @@ const AnalyticsView = ({ token, logout }) => {
 const AlertsView = ({ token, logout }) => {
   const [rules, setRules] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [form, setForm] = useState({ tier: 'CRITICAL', email: '', is_enabled: true });
+  const [form, setForm] = useState({ stakeholder_name: '', tier: 'CRITICAL', email: '', is_enabled: true });
+
+  const tierDescriptions = {
+    INFO: 'All logged network incidents',
+    WARNING: 'Major and critical incidents',
+    CRITICAL: 'Critical outages only'
+  };
 
   const loadRules = async () => {
     setLoading(true);
@@ -779,10 +940,21 @@ const AlertsView = ({ token, logout }) => {
         body: JSON.stringify(form)
       });
       if (res.ok) {
-        setForm({ ...form, email: '' });
+        setForm({ stakeholder_name: '', tier: form.tier, email: '', is_enabled: true });
         loadRules();
       }
     } catch (e) { console.error('Failed to add rule'); }
+  };
+
+  const handleUpdate = async (id, payload) => {
+    try {
+      await fetch(`/api/notification-rules/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify(payload)
+      });
+      loadRules();
+    } catch (e) { console.error('Failed to update rule'); }
   };
 
   const handleDelete = async (id) => {
@@ -812,6 +984,15 @@ const AlertsView = ({ token, logout }) => {
             <h3 className="text-lg font-bold flex items-center gap-2"><PlusCircle size={18} className="text-accent-teal" /> Add Alert Rule</h3>
             <form onSubmit={handleAdd} className="space-y-4">
               <div className="space-y-2">
+                <label className="text-[10px] font-black uppercase tracking-widest text-text-muted">Stakeholder Name</label>
+                <input
+                  value={form.stakeholder_name}
+                  onChange={e => setForm({ ...form, stakeholder_name: e.target.value })}
+                  className="w-full bg-white/5 border border-white/10 rounded-lg p-3 text-sm text-white outline-none focus:border-accent-gold"
+                  placeholder="e.g. ICT Manager"
+                />
+              </div>
+              <div className="space-y-2">
                 <label className="text-[10px] font-black uppercase tracking-widest text-text-muted">Threshold Tier</label>
                 <select 
                   value={form.tier}
@@ -822,6 +1003,7 @@ const AlertsView = ({ token, logout }) => {
                   <option value="WARNING" className="bg-[#0f172a]">WARNING (Major+)</option>
                   <option value="CRITICAL" className="bg-[#0f172a]">CRITICAL (Outages)</option>
                 </select>
+                <p className="text-[10px] font-bold text-text-muted">{form.tier} - {tierDescriptions[form.tier]}</p>
               </div>
               <div className="space-y-2">
                 <label className="text-[10px] font-black uppercase tracking-widest text-text-muted">Stakeholder Email</label>
@@ -834,6 +1016,14 @@ const AlertsView = ({ token, logout }) => {
                   required
                 />
               </div>
+              <label className="flex items-center gap-3 p-3 bg-white/5 border border-white/10 rounded-lg text-xs font-bold text-text-muted">
+                <input
+                  type="checkbox"
+                  checked={form.is_enabled}
+                  onChange={e => setForm({ ...form, is_enabled: e.target.checked })}
+                />
+                Enabled
+              </label>
               <button className="premium-button w-full py-4 text-xs font-black">SAVE ALERT RULE</button>
             </form>
           </div>
@@ -852,18 +1042,41 @@ const AlertsView = ({ token, logout }) => {
               </thead>
               <tbody className="divide-y divide-white/5">
                 {rules.length === 0 ? (
-                  <tr><td colSpan="4" className="px-6 py-10 text-center text-text-muted italic text-sm">No alert rules configured.</td></tr>
+                  <tr>
+                    <td colSpan="4" className="px-6 py-12 text-center">
+                      <div className="flex flex-col items-center gap-3">
+                        <div className="w-12 h-12 rounded-full bg-accent-gold/10 flex items-center justify-center text-accent-gold">
+                          <Mail size={22} />
+                        </div>
+                        <div>
+                          <p className="text-sm font-black text-white uppercase tracking-widest">No alert rules configured</p>
+                          <p className="text-xs text-text-muted mt-1">Add ICT Manager, Engineers, or NOC Desk recipients for network escalations.</p>
+                        </div>
+                      </div>
+                    </td>
+                  </tr>
                 ) : rules.map(rule => (
                   <tr key={rule.id} className="hover:bg-white/5 transition-colors">
-                    <td className="px-6 py-4 font-bold text-sm">{rule.email}</td>
+                    <td className="px-6 py-4">
+                      <div className="flex flex-col">
+                        <span className="font-bold text-sm text-white">{rule.stakeholder_name || 'Stakeholder'}</span>
+                        <span className="text-[10px] text-text-muted">{rule.email}</span>
+                      </div>
+                    </td>
                     <td className="px-6 py-4">
                       <span className={`text-[9px] font-black px-2 py-0.5 rounded border ${
                         rule.tier === 'CRITICAL' ? 'border-accent-red text-accent-red' : 
                         rule.tier === 'WARNING' ? 'border-accent-gold text-accent-gold' : 'border-accent-teal text-accent-teal'
                       }`}>{rule.tier}</span>
+                      <p className="text-[10px] text-text-muted mt-1">{tierDescriptions[rule.tier]}</p>
                     </td>
                     <td className="px-6 py-4">
-                      <span className="text-[10px] font-bold px-3 py-1 rounded-full status-active">Active</span>
+                      <button
+                        onClick={() => handleUpdate(rule.id, { is_enabled: !rule.is_enabled })}
+                        className={`text-[10px] font-bold px-3 py-1 rounded-full ${rule.is_enabled ? 'status-resolved' : 'bg-white/5 text-text-muted'}`}
+                      >
+                        {rule.is_enabled ? 'Enabled' : 'Paused'}
+                      </button>
                     </td>
                     <td className="px-6 py-4 text-right">
                       <Trash2 size={16} className="text-text-muted hover:text-accent-red cursor-pointer inline-block" onClick={() => handleDelete(rule.id)} />
@@ -879,67 +1092,350 @@ const AlertsView = ({ token, logout }) => {
   );
 };
 
-const Dashboard = ({ stats, setPeriod, handleExport, setActiveTab, logs, setSelectedLogId, setShowDeleteModal, notifications }) => (
-  <div className="space-y-8 animate-in fade-in duration-500">
-    <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
-      <div className="glass-card p-6 flex flex-col gap-4 border-t-4 border-t-accent-red">
-        <div className="flex justify-between items-start"><span className="text-sm font-bold text-text-muted uppercase tracking-wider">Day logs</span><AlertTriangle className="text-accent-red" size={24} /></div>
-        <span className="text-4xl font-black text-white">{stats.day_logs_count}</span>
-        <div className="flex gap-2">
-          <button onClick={() => setPeriod('day')} className="flex-1 py-2 bg-white/5 hover:bg-white/10 rounded-lg text-[10px] font-black uppercase text-white tracking-widest border border-white/5">VIEW DATA</button>
-          <button onClick={() => handleExport('day')} className="px-3 py-2 bg-accent-red/10 hover:bg-accent-red/20 rounded-lg text-accent-red border border-accent-red/20"><Download size={14} /></button>
+const Dashboard = ({ stats, setPeriod, handleExport, setActiveTab, logs, setSelectedLogId, setShowDeleteModal, notifications }) => {
+  const activeLogs = logs.filter(log => ACTIVE_STATUSES.includes(log.status));
+  const criticalActive = activeLogs.filter(log => log.severity === 'Critical');
+  const latestIncident = logs?.[0];
+
+  return (
+    <div className="space-y-8 animate-in fade-in duration-500">
+      {criticalActive.length > 0 && (
+        <div className="glass-card p-4 border-t-4 border-t-accent-red flex items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-full bg-accent-red/10 flex items-center justify-center text-accent-red">
+              <AlertTriangle size={22} />
+            </div>
+            <div>
+              <p className="text-xs font-black uppercase tracking-widest text-accent-red">Critical Active Fault</p>
+              <p className="text-sm font-bold text-white">{criticalActive[0].location} internet outage</p>
+            </div>
+          </div>
+          <button onClick={() => setActiveTab('active')} className="premium-button-red text-xs py-3">VIEW ACTIVE</button>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+        <div className="glass-card p-6 min-h-[150px] flex flex-col justify-between border-t-4 border-t-accent-red">
+          <div className="flex justify-between items-start"><span className="text-sm font-bold text-text-muted uppercase tracking-wider">Active faults</span><AlertTriangle className="text-accent-red" size={24} /></div>
+          <div className="flex justify-center items-center flex-1">
+            <span className="text-5xl font-black text-white leading-none">{stats.active_faults ?? activeLogs.length}</span>
+          </div>
+          <button onClick={() => setActiveTab('active')} className="w-full py-2 bg-white/5 hover:bg-white/10 rounded-lg text-[10px] font-black uppercase text-white tracking-widest border border-white/5">VIEW QUEUE</button>
+        </div>
+        <div className="glass-card p-6 min-h-[150px] flex flex-col justify-between border-t-4 border-t-accent-gold">
+          <div className="flex justify-between items-start"><span className="text-sm font-bold text-text-muted uppercase tracking-wider">Critical</span><ShieldCheck className="text-accent-gold" size={24} /></div>
+          <div className="flex justify-center items-center flex-1">
+            <span className="text-5xl font-black text-white leading-none">{stats.critical_incidents ?? criticalActive.length}</span>
+          </div>
+          <p className="text-[10px] text-text-muted font-bold uppercase tracking-widest">Needs fastest response</p>
+        </div>
+        <div className="glass-card p-6 min-h-[150px] flex flex-col justify-between border-t-4 border-t-accent-teal">
+          <div className="flex justify-between items-start"><span className="text-sm font-bold text-text-muted uppercase tracking-wider">Resolved today</span><CheckCircle className="text-accent-teal" size={24} /></div>
+          <div className="flex justify-center items-center flex-1">
+            <span className="text-5xl font-black text-white leading-none">{stats.resolved_today}</span>
+          </div>
+          <p className="text-[10px] text-text-muted font-bold uppercase tracking-widest">Closed operational work</p>
+        </div>
+        <div className="glass-card p-6 min-h-[150px] flex flex-col justify-between border-t-4 border-t-primary-blue cursor-pointer hover:bg-white/5 transition-all" onClick={() => setActiveTab('analytics')}>
+          <div className="flex justify-between items-start"><span className="text-sm font-bold text-text-muted uppercase tracking-wider">Most affected ISP</span><BarChart3 className="text-primary-blue" size={24} /></div>
+          <div className="flex justify-center items-center flex-1 text-center">
+            <span className="text-3xl font-black text-white truncate">{stats.most_affected_isp || 'None'}</span>
+          </div>
+          <button className="w-full py-2 bg-white/5 hover:bg-white/10 rounded-lg text-[10px] font-black text-white uppercase tracking-widest border border-white/5">OPEN ANALYTICS</button>
         </div>
       </div>
-      <div className="glass-card p-6 flex flex-col gap-4 border-t-4 border-t-accent-teal">
-        <div className="flex justify-between items-start"><span className="text-sm font-bold text-text-muted uppercase tracking-wider">Weekly logs</span><CheckCircle className="text-accent-teal" size={24} /></div>
-        <span className="text-4xl font-black text-white">{stats.week_logs_count}</span>
-        <div className="flex gap-2">
-          <button onClick={() => setPeriod('week')} className="flex-1 py-2 bg-white/5 hover:bg-white/10 rounded-lg text-[10px] font-black uppercase text-white tracking-widest border border-white/5">VIEW DATA</button>
-          <button onClick={() => handleExport('week')} className="px-3 py-2 bg-accent-teal/10 hover:bg-accent-teal/20 rounded-lg text-accent-teal border border-accent-teal/20"><Download size={14} /></button>
+
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+        {[['day', stats.day_logs_count, 'Day logs', 'border-t-accent-red'], ['week', stats.week_logs_count, 'Weekly logs', 'border-t-accent-teal'], ['month', stats.month_logs_count, 'Monthly logs', 'border-t-primary-blue']].map(([key, value, label, border]) => (
+          <div key={key} className={`glass-card p-6 min-h-[150px] flex flex-col justify-between border-t-4 ${border}`}>
+            <div className="flex justify-between items-start">
+              <span className="text-sm font-bold text-text-muted uppercase tracking-wider">{label}</span>
+              {key === 'day' ? <AlertTriangle className="text-accent-red" size={22} /> : key === 'week' ? <CheckCircle className="text-accent-teal" size={22} /> : <History className="text-primary-blue" size={22} />}
+            </div>
+            <div className="flex justify-center items-center flex-1">
+              <span className="text-5xl font-black text-white leading-none">{value}</span>
+            </div>
+            <div className="flex gap-2">
+              <button onClick={() => setPeriod(key)} className="flex-1 py-2 bg-white/5 hover:bg-white/10 rounded-lg text-[10px] font-black uppercase text-white tracking-widest border border-white/5">VIEW</button>
+              <button onClick={() => handleExport(key)} className="px-3 py-2 bg-white/5 hover:bg-white/10 rounded-lg text-white border border-white/5"><Download size={14} /></button>
+            </div>
+          </div>
+        ))}
+        <div className="glass-card p-6 min-h-[150px] flex flex-col justify-between border-t-4 border-t-accent-gold cursor-pointer hover:bg-white/5 transition-all" onClick={() => setActiveTab('history')}>
+          <div className="flex justify-between items-start">
+            <span className="text-sm font-bold text-text-muted uppercase tracking-wider">Latest Incident</span>
+            <Activity className="text-accent-gold" size={22} />
+          </div>
+          {latestIncident ? (
+            <div className="flex flex-col items-center justify-center text-center flex-1">
+              <span className="text-xl font-black text-white tracking-tight">{latestIncident.ticket_number || `BCC-NET-2026-${String(latestIncident.id).padStart(4, '0')}`}</span>
+              <span className="text-sm font-bold text-text-muted uppercase tracking-widest mt-3">{latestIncident.location}</span>
+            </div>
+          ) : (
+            <div className="flex flex-col items-center justify-center text-center flex-1">
+              <span className="text-sm font-bold text-text-muted uppercase tracking-widest">No incidents yet</span>
+            </div>
+          )}
+          <button className="w-full py-2 bg-accent-gold/10 hover:bg-accent-gold/20 rounded-lg text-[10px] font-black text-accent-gold uppercase tracking-widest border border-accent-gold/20">VIEW INCIDENT</button>
         </div>
       </div>
-      <div className="glass-card p-6 flex flex-col gap-4 border-t-4 border-t-primary-blue">
-        <div className="flex justify-between items-start"><span className="text-sm font-bold text-text-muted uppercase tracking-wider">Monthly logs</span><History className="text-primary-blue" size={24} /></div>
-        <span className="text-4xl font-black text-white">{stats.month_logs_count}</span>
-        <div className="flex gap-2">
-          <button onClick={() => setPeriod('month')} className="flex-1 py-2 bg-white/5 hover:bg-white/10 rounded-lg text-[10px] font-black uppercase text-white tracking-widest border border-white/5">VIEW DATA</button>
-          <button onClick={() => handleExport('month')} className="px-3 py-2 bg-primary-blue/10 hover:bg-primary-blue/20 rounded-lg text-primary-blue border border-primary-blue/20"><Download size={14} /></button>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+        <div className="lg:col-span-2 space-y-6">
+          <div className="flex justify-between items-center"><h3 className="text-xl font-bold flex items-center gap-2"><Activity className="text-accent-teal" size={20} />Live Incident Feed</h3><button onClick={() => setActiveTab('log-incident')} className="premium-button-red flex items-center gap-2 text-sm"><PlusCircle size={18} /> LOG INCIDENT</button></div>
+          <div className="glass-card overflow-hidden">
+            {logs.length === 0 ? (
+              <div className="p-12 text-center text-text-muted text-sm font-bold">No active network faults.</div>
+            ) : (
+              <table className="w-full text-left">
+                <thead><tr className="bg-white/5 text-[10px] text-text-muted uppercase tracking-widest"><th className="px-6 py-4">Ticket</th><th className="px-6 py-4">Provider</th><th className="px-6 py-4">Severity</th><th className="px-6 py-4">Status</th><th className="px-6 py-4">Duration</th><th className="px-6 py-4 text-right">Action</th></tr></thead>
+                <tbody className="divide-y divide-white/5">{logs.slice(0, 8).map(log => (
+                  <tr key={log.id} className="hover:bg-white/5 transition-colors group">
+                    <td className="px-6 py-4 text-xs font-mono text-accent-gold">{log.ticket_number || `#${log.id}`}</td>
+                    <td className="px-6 py-4"><div className="flex items-center gap-3">{log.attachment_path && (<div className="w-8 h-8 rounded-lg overflow-hidden border border-white/10 shrink-0"><img src={`/api/${log.attachment_path}`} className="w-full h-full object-cover" alt="Log" /></div>)}<div className="flex flex-col"><span className="font-bold text-sm">{log.isp_name}</span><span className="text-[10px] text-text-muted flex items-center gap-1"><MapPin size={10} /> {log.location}</span></div></div></td>
+                    <td className="px-6 py-4"><span className={`text-[10px] font-black px-2 py-0.5 rounded border ${log.severity === 'Critical' ? 'border-accent-red text-accent-red' : log.severity === 'Major' ? 'border-accent-gold text-accent-gold' : 'border-accent-teal text-accent-teal'}`}>{log.severity.toUpperCase()}</span></td>
+                    <td className="px-6 py-4"><span className={`text-[10px] font-bold px-3 py-1 rounded-full ${getStatusClass(log.status)}`}>{log.status}</span></td>
+                    <td className="px-6 py-4 text-xs text-text-muted">{formatDuration(log.created_at, log.resolved_at || log.closed_at)}</td>
+                    <td className="px-6 py-4 text-right"><div className="flex items-center justify-end gap-3"><button onClick={() => setActiveTab('history')} className="p-2 bg-white/5 hover:bg-white/10 rounded-lg text-white"><ChevronRight size={16} /></button><Trash2 size={16} className="text-text-muted hover:text-accent-red cursor-pointer" onClick={(e) => { e.stopPropagation(); setSelectedLogId(log.id); setShowDeleteModal(true); }} /></div></td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            )}
+          </div>
         </div>
-      </div>
-      <div className="glass-card p-6 flex flex-col gap-4 border-t-4 border-t-accent-gold cursor-pointer" onClick={() => setActiveTab('analytics')}>
-        <div className="flex justify-between items-start"><span className="text-sm font-bold text-text-muted uppercase tracking-wider">ISP Analytics</span><BarChart3 className="text-accent-gold" size={24} /></div>
-        <span className="text-4xl font-black text-white">View</span>
-        <button className="w-full py-2 bg-accent-gold/10 hover:bg-accent-gold/20 rounded-lg text-[10px] font-black text-accent-gold uppercase tracking-widest border border-accent-gold/20">OPEN DASHBOARD</button>
+        <div className="space-y-6"><h3 className="text-xl font-bold flex items-center gap-2"><Bell className="text-accent-gold" size={20} />Live Notifications</h3><div className="space-y-4">{notifications.length === 0 ? (<div className="glass-card p-8 text-center text-text-muted italic text-sm">No recent activity.</div>) : notifications.map((n, i) => (<div key={i} className="glass-card p-4 border-l-4 border-accent-gold flex gap-3 animate-in slide-in-from-right duration-300"><div className="p-2 bg-accent-gold/10 rounded text-accent-gold h-fit"><Activity size={16} /></div><div><p className="text-xs font-bold text-white uppercase tracking-tighter">{n.event.replaceAll('_', ' ')}</p><p className="text-xs text-text-muted mt-1">Ref: <span className="text-white">{n.ticket || n.id || '-'}</span></p></div></div>))}</div></div>
       </div>
     </div>
-    <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-      <div className="lg:col-span-2 space-y-6">
-        <div className="flex justify-between items-center"><h3 className="text-xl font-bold flex items-center gap-2"><Activity className="text-accent-teal" size={20} />Live Incident Feed</h3><button onClick={() => setActiveTab('log-incident')} className="premium-button-red flex items-center gap-2 text-sm"><PlusCircle size={18} /> LOG INCIDENT</button></div>
-        <div className="glass-card overflow-hidden">
+  );
+};
+
+const ActiveFaultsView = ({ logs, formatDate, onResolve, onUpdateFault, assignees }) => {
+  const activeLogs = logs.filter(l => ACTIVE_STATUSES.includes(l.status));
+
+  const updateStatus = async (log, status) => {
+    if (status === 'Resolved' || status === 'Closed') {
+      onResolve(log);
+      return;
+    }
+    await onUpdateFault(log.id, { status });
+  };
+
+  const updateAssignee = async (log, assigned_to) => {
+    const payload = { assigned_to };
+    if (assigned_to && log.status === 'Open') payload.status = 'Assigned';
+    await onUpdateFault(log.id, payload);
+  };
+
+  return (
+    <div className="space-y-6 animate-in fade-in duration-500">
+      <div className="flex justify-between items-center">
+        <div>
+          <h2 className="text-3xl font-black text-white uppercase tracking-tight">Active Incidents</h2>
+          <p className="text-xs text-text-muted mt-1">Critical faults stay sorted first for NOC visibility</p>
+        </div>
+      </div>
+      <div className="glass-card overflow-hidden">
+        {activeLogs.length === 0 ? (
+          <div className="p-12 text-center text-text-muted text-sm font-bold">No active network faults.</div>
+        ) : (
           <table className="w-full text-left">
-            <thead><tr className="bg-white/5 text-[10px] text-text-muted uppercase tracking-widest"><th className="px-6 py-4">Provider</th><th className="px-6 py-4">Severity</th><th className="px-6 py-4">Status</th><th className="px-6 py-4">Logged</th><th className="px-6 py-4 text-right">View</th></tr></thead>
-            <tbody className="divide-y divide-white/5">{logs.slice(0, 8).map(log => (<tr key={log.id} className="hover:bg-white/5 transition-colors group"><td className="px-6 py-4"><div className="flex items-center gap-3"><div className="w-8 h-8 p-1 bg-white/5 rounded-lg border border-white/5 shrink-0 flex items-center justify-center"><img src="/logo.png" className="w-full h-full object-contain" alt="BCC" /></div>{log.attachment_path && (<div className="w-8 h-8 rounded-lg overflow-hidden border border-white/10 shrink-0"><img src={`/api/${log.attachment_path}`} className="w-full h-full object-cover" alt="Log" /></div>)}<div className="flex flex-col"><span className="font-bold text-sm">{log.isp_name}</span><span className="text-[10px] text-text-muted flex items-center gap-1"><MapPin size={10} /> {log.location}</span></div></div></td><td className="px-6 py-4"><span className={`text-[10px] font-black px-2 py-0.5 rounded border ${log.severity === 'Critical' ? 'border-accent-red text-accent-red' : log.severity === 'Major' ? 'border-accent-gold text-accent-gold' : 'border-accent-teal text-accent-teal'}`}>{log.severity.toUpperCase()}</span></td><td className="px-6 py-4"><span className={`text-[10px] font-bold px-3 py-1 rounded-full ${log.status === 'Open' ? 'status-active' : log.status === 'Investigating' ? 'status-resolving' : 'status-resolved'}`}>{log.status}</span></td><td className="px-6 py-4 text-xs text-text-muted">{new Date(log.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</td><td className="px-6 py-4 text-right"><div className="flex items-center justify-end gap-3"><ChevronRight size={18} className="text-text-muted group-hover:text-white cursor-pointer" /><Trash2 size={16} className="text-text-muted hover:text-accent-red cursor-pointer" onClick={(e) => { e.stopPropagation(); setSelectedLogId(log.id); setShowDeleteModal(true); }} /></div></td></tr>))}</tbody>
+            <thead><tr className="bg-white/5 text-[10px] text-text-muted uppercase tracking-widest"><th className="px-6 py-4">Ticket</th><th className="px-6 py-4">Provider</th><th className="px-6 py-4">Location</th><th className="px-6 py-4">Severity</th><th className="px-6 py-4">Assigned</th><th className="px-6 py-4">Status</th><th className="px-6 py-4">Duration</th><th className="px-6 py-4 text-right">Actions</th></tr></thead>
+            <tbody className="divide-y divide-white/5">{activeLogs.map(log => (
+              <tr key={log.id} className="hover:bg-white/5 transition-colors">
+                <td className="px-6 py-4 text-xs font-mono text-accent-gold">{log.ticket_number || `#${log.id}`}</td>
+                <td className="px-6 py-4 font-bold">{log.isp_name}</td>
+                <td className="px-6 py-4 text-sm text-text-muted">{log.location}</td>
+                <td className="px-6 py-4"><span className={`text-[10px] font-black px-2 py-0.5 rounded border ${log.severity === 'Critical' ? 'border-accent-red text-accent-red' : log.severity === 'Major' ? 'border-accent-gold text-accent-gold' : 'border-accent-teal text-accent-teal'}`}>{log.severity.toUpperCase()}</span></td>
+                <td className="px-6 py-4">
+                  <select value={log.assigned_to || ''} onChange={e => updateAssignee(log, e.target.value)} className="bg-[#1e293b]/50 border border-white/10 rounded-lg p-2 text-xs text-white outline-none">
+                    <option value="">Unassigned</option>
+                    {assignees.map(a => <option key={a.id} value={a.username}>{a.username}</option>)}
+                  </select>
+                </td>
+                <td className="px-6 py-4">
+                  <select value={log.status} onChange={e => updateStatus(log, e.target.value)} className={`text-[10px] font-bold px-3 py-2 rounded-lg border border-white/10 ${getStatusClass(log.status)}`}>
+                    {STATUS_OPTIONS.map(s => <option key={s} value={s}>{s}</option>)}
+                  </select>
+                </td>
+                <td className="px-6 py-4 text-xs text-white/70"><div className="flex flex-col"><span>{formatDuration(log.created_at)}</span><span className="text-[10px] text-text-muted">{formatDate(log.created_at)}</span></div></td>
+                <td className="px-6 py-4 text-right"><button onClick={() => onResolve(log)} className="bg-accent-teal/20 text-accent-teal hover:bg-accent-teal hover:text-white px-4 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all">Mark Resolved</button></td>
+              </tr>
+            ))}</tbody>
           </table>
+        )}
+      </div>
+    </div>
+  );
+};
+
+const FaultLogsView = ({ logs, formatDate, setSelectedLogId, setShowDeleteModal, setActiveTab, token, logout, onUpdateFault, onResolve, assignees, refreshLogs }) => {
+  const [viewingLog, setViewingLog] = useState(null);
+  const [timeline, setTimeline] = useState([]);
+  const [comments, setComments] = useState([]);
+  const [commentText, setCommentText] = useState('');
+  const [detailError, setDetailError] = useState('');
+  const [searchTerm, setSearchTerm] = useState('');
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [severityFilter, setSeverityFilter] = useState('all');
+  const [ispFilter, setIspFilter] = useState('all');
+  const [locationFilter, setLocationFilter] = useState('all');
+
+  const uniqueIsps = Array.from(new Set(logs.map(l => l.isp_name).filter(Boolean))).sort();
+  const uniqueLocations = Array.from(new Set(logs.map(l => l.location).filter(Boolean))).sort();
+
+  const loadDetailData = async (faultId) => {
+    try {
+      const [timelineRes, commentsRes] = await Promise.all([
+        fetch(`/api/faults/${faultId}/timeline`, { headers: { 'Authorization': `Bearer ${token}` } }),
+        fetch(`/api/faults/${faultId}/comments`, { headers: { 'Authorization': `Bearer ${token}` } })
+      ]);
+      if (timelineRes.status === 401 || commentsRes.status === 401) return logout();
+      if (timelineRes.ok) setTimeline(await timelineRes.json());
+      if (commentsRes.ok) setComments(await commentsRes.json());
+    } catch (err) {
+      setDetailError('Failed to load incident history');
+    }
+  };
+
+  useEffect(() => {
+    if (viewingLog) loadDetailData(viewingLog.id);
+  }, [viewingLog?.id]);
+
+  const filteredLogs = logs.filter(log => {
+    const haystack = [log.ticket_number, log.id, log.isp_name, log.location, log.fault_type, log.description, log.assigned_to, log.status].join(' ').toLowerCase();
+    return (
+      (!searchTerm || haystack.includes(searchTerm.toLowerCase())) &&
+      (statusFilter === 'all' || log.status === statusFilter) &&
+      (severityFilter === 'all' || log.severity === severityFilter) &&
+      (ispFilter === 'all' || log.isp_name === ispFilter) &&
+      (locationFilter === 'all' || log.location === locationFilter)
+    );
+  });
+
+  const updateViewingLog = async (payload) => {
+    try {
+      const updated = await onUpdateFault(viewingLog.id, payload);
+      setViewingLog(updated);
+      await loadDetailData(viewingLog.id);
+    } catch (err) {
+      setDetailError(err.message || 'Failed to update incident');
+    }
+  };
+
+  const addComment = async () => {
+    if (!commentText.trim()) return;
+    try {
+      const res = await fetch(`/api/faults/${viewingLog.id}/comments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({ comment: commentText.trim() })
+      });
+      if (res.status === 401) return logout();
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || 'Failed to add comment');
+      }
+      setCommentText('');
+      await loadDetailData(viewingLog.id);
+      refreshLogs();
+    } catch (err) {
+      setDetailError(err.message || 'Failed to add comment');
+    }
+  };
+
+  if (viewingLog) {
+    const isImageAttachment = /\.(png|jpe?g|webp)$/i.test(viewingLog.attachment_path || '');
+
+    return (
+      <div className="space-y-6 animate-in fade-in duration-500 max-w-5xl mx-auto pb-20">
+        <div className="flex justify-between items-center mb-8">
+          <div>
+            <h3 className="text-3xl font-black text-white uppercase tracking-tight">Incident Details</h3>
+            <p className="text-xs text-text-muted font-bold uppercase tracking-widest mt-1">Ref: {viewingLog.ticket_number || `#${viewingLog.id}`}</p>
+          </div>
+          <div className="flex gap-4">
+            <button onClick={() => setViewingLog(null)} className="px-6 py-3 bg-white/5 hover:bg-white/10 text-white text-xs font-bold uppercase tracking-widest rounded-xl transition-colors border border-white/10">Back to Reports</button>
+            <button onClick={() => { setViewingLog(null); setActiveTab('dashboard'); }} className="premium-button text-xs py-3 px-6">Dashboard</button>
+          </div>
+        </div>
+
+        <div className="glass-card p-10 space-y-10 border-t-4 border-t-accent-gold">
+          <div className="grid grid-cols-2 lg:grid-cols-3 gap-8">
+            <div><p className="text-[10px] font-black text-text-muted uppercase tracking-widest mb-1">Ticket</p><p className="font-mono text-accent-gold text-xl">{viewingLog.ticket_number || `#${viewingLog.id}`}</p></div>
+            <div><p className="text-[10px] font-black text-text-muted uppercase tracking-widest mb-1">Provider</p><p className="font-bold text-white text-xl">{viewingLog.isp_name}</p></div>
+            <div><p className="text-[10px] font-black text-text-muted uppercase tracking-widest mb-1">Location</p><p className="font-bold text-white text-xl">{viewingLog.location}</p></div>
+            <div><p className="text-[10px] font-black text-text-muted uppercase tracking-widest mb-1">Status</p><select value={viewingLog.status} onChange={e => { if (e.target.value === 'Resolved' || e.target.value === 'Closed') onResolve(viewingLog); else updateViewingLog({ status: e.target.value }); }} className={`mt-1 text-[11px] font-bold px-4 py-2 rounded-lg border border-white/10 ${getStatusClass(viewingLog.status)}`}>{STATUS_OPTIONS.map(s => <option key={s} value={s}>{s}</option>)}</select></div>
+            <div><p className="text-[10px] font-black text-text-muted uppercase tracking-widest mb-1">Severity</p><span className={`inline-block mt-1 text-[11px] font-black px-3 py-1 rounded border ${viewingLog.severity === 'Critical' ? 'border-accent-red text-accent-red' : viewingLog.severity === 'Major' ? 'border-accent-gold text-accent-gold' : 'border-accent-teal text-accent-teal'}`}>{viewingLog.severity.toUpperCase()}</span></div>
+            <div><p className="text-[10px] font-black text-text-muted uppercase tracking-widest mb-1">Assigned To</p><select value={viewingLog.assigned_to || ''} onChange={e => updateViewingLog({ assigned_to: e.target.value, status: e.target.value && viewingLog.status === 'Open' ? 'Assigned' : viewingLog.status })} className="bg-[#1e293b]/50 border border-white/10 rounded-lg p-2 text-sm text-white outline-none"><option value="">Unassigned</option>{assignees.map(a => <option key={a.id} value={a.username}>{a.username}</option>)}</select></div>
+            <div><p className="text-[10px] font-black text-text-muted uppercase tracking-widest mb-1">Logged At</p><p className="text-base text-text-muted font-medium">{formatDate(viewingLog.created_at)}</p></div>
+            <div><p className="text-[10px] font-black text-text-muted uppercase tracking-widest mb-1">Resolved At</p><p className="text-base text-text-muted font-medium">{viewingLog.resolved_at ? formatDate(viewingLog.resolved_at) : 'Not Resolved'}</p></div>
+            <div><p className="text-[10px] font-black text-text-muted uppercase tracking-widest mb-1">Duration</p><p className="text-base text-white font-bold">{formatDuration(viewingLog.created_at, viewingLog.resolved_at || viewingLog.closed_at)}</p></div>
+          </div>
+
+          <div>
+            <p className="text-[11px] font-black text-text-muted uppercase tracking-widest mb-3 border-t border-white/10 pt-8">Incident Summary</p>
+            <div className="p-6 bg-[#0f172a] rounded-2xl border border-white/5 text-base text-white/90 leading-relaxed whitespace-pre-wrap">{viewingLog.description || 'No description provided.'}</div>
+          </div>
+
+          {viewingLog.resolution_note && (
+            <div>
+              <p className="text-[11px] font-black text-text-muted uppercase tracking-widest mb-3 border-t border-white/10 pt-8">Resolution Note</p>
+              <div className="p-6 bg-accent-teal/10 rounded-2xl border border-accent-teal/20 text-base text-white/90 leading-relaxed whitespace-pre-wrap">{viewingLog.resolution_note}</div>
+            </div>
+          )}
+
+          {viewingLog.attachment_path && (
+            <div>
+              <p className="text-[11px] font-black text-text-muted uppercase tracking-widest mb-3 border-t border-white/10 pt-8">Proof of Outage</p>
+              <div className="rounded-2xl overflow-hidden border border-white/10 bg-[#0f172a]/50 p-4 flex justify-center">
+                {isImageAttachment ? <img src={`/api/${viewingLog.attachment_path}`} alt="Incident Attachment" className="max-w-full rounded-xl shadow-2xl" /> : <a href={`/api/${viewingLog.attachment_path}`} target="_blank" className="premium-button text-xs">OPEN ATTACHMENT</a>}
+              </div>
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 border-t border-white/10 pt-8">
+            <div className="space-y-4">
+              <p className="text-[11px] font-black text-text-muted uppercase tracking-widest flex items-center gap-2"><History size={14} /> Incident Timeline</p>
+              <div className="space-y-3">{timeline.length === 0 ? <div className="p-6 bg-white/5 rounded-2xl text-sm text-text-muted">No timeline activity yet.</div> : timeline.map(item => <div key={item.id} className="p-4 bg-white/5 rounded-2xl border border-white/5"><div className="flex justify-between gap-3"><p className="text-sm font-black text-white">{item.action}</p><p className="text-[10px] text-text-muted">{formatDate(item.created_at)}</p></div><p className="text-xs text-text-muted mt-1 whitespace-pre-wrap">{item.details}</p><p className="text-[10px] text-accent-gold mt-2 font-bold uppercase tracking-widest">{item.actor}</p></div>)}</div>
+            </div>
+
+            <div className="space-y-4">
+              <p className="text-[11px] font-black text-text-muted uppercase tracking-widest flex items-center gap-2"><MessageSquare size={14} /> Engineer Updates</p>
+              <div className="space-y-3">{comments.length === 0 ? <div className="p-6 bg-white/5 rounded-2xl text-sm text-text-muted">No engineer updates yet.</div> : comments.map(comment => <div key={comment.id} className="p-4 bg-white/5 rounded-2xl border border-white/5"><p className="text-sm text-white whitespace-pre-wrap">{comment.comment}</p><p className="text-[10px] text-text-muted mt-2">{comment.created_by} - {formatDate(comment.created_at)}</p></div>)}</div>
+              <div className="flex gap-3"><input value={commentText} onChange={e => setCommentText(e.target.value)} onKeyDown={e => e.key === 'Enter' && addComment()} placeholder="Add update..." className="flex-1 bg-[#1e293b]/50 border border-white/10 rounded-lg p-3 text-sm text-white outline-none" /><button onClick={addComment} className="premium-button px-4"><Send size={16} /></button></div>
+              {detailError && <p className="text-[10px] text-accent-red font-bold">{detailError}</p>}
+            </div>
+          </div>
         </div>
       </div>
-      <div className="space-y-6"><h3 className="text-xl font-bold flex items-center gap-2"><Bell className="text-accent-gold" size={20} />Live Notifications</h3><div className="space-y-4">{notifications.length === 0 ? (<div className="glass-card p-8 text-center text-text-muted italic text-sm">No recent activity.</div>) : notifications.map((n, i) => (<div key={i} className="glass-card p-4 border-l-4 border-accent-gold flex gap-3 animate-in slide-in-from-right duration-300"><div className="p-2 bg-accent-gold/10 rounded text-accent-gold h-fit"><Activity size={16} /></div><div><p className="text-xs font-bold text-white uppercase tracking-tighter">{n.event.replace('_', ' ')}</p><p className="text-xs text-text-muted mt-1">Provider: <span className="text-white">{n.isp}</span></p></div></div>))}</div></div>
-    </div>
-  </div>
-);
+    );
+  }
 
-const ActiveFaultsView = ({ logs, formatDate, handleResolve }) => (
-  <div className="space-y-6 animate-in fade-in duration-500">
-    <h2 className="text-3xl font-black text-white uppercase tracking-tight">Active Incidents</h2>
-    <div className="glass-card overflow-hidden">
-      <table className="w-full text-left">
-        <thead><tr className="bg-white/5 text-[10px] text-text-muted uppercase tracking-widest"><th className="px-6 py-4">Provider</th><th className="px-6 py-4">Location</th><th className="px-6 py-4">Severity</th><th className="px-6 py-4">Status</th><th className="px-6 py-4">Logged At</th><th className="px-6 py-4 text-right">Actions</th></tr></thead>
-        <tbody className="divide-y divide-white/5">{logs.filter(l => l.status !== 'Resolved').map(log => (<tr key={log.id} className="hover:bg-white/5 transition-colors"><td className="px-6 py-4 font-bold">{log.isp_name}</td><td className="px-6 py-4 text-sm text-text-muted">{log.location}</td><td className="px-6 py-4"><span className={`text-[10px] font-black px-2 py-0.5 rounded border ${log.severity === 'Critical' ? 'border-accent-red text-accent-red' : 'border-accent-gold text-accent-gold'}`}>{log.severity.toUpperCase()}</span></td><td className="px-6 py-4"><span className="text-[10px] font-bold px-3 py-1 rounded-full status-active">{log.status}</span></td><td className="px-6 py-4 text-xs text-white/70">{formatDate(log.created_at)}</td><td className="px-6 py-4 text-right"><button onClick={() => handleResolve(log.id)} className="bg-accent-teal/20 text-accent-teal hover:bg-accent-teal hover:text-white px-4 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all">Mark Resolved</button></td></tr>))}</tbody>
-      </table>
+  return (
+    <div className="space-y-6 animate-in fade-in duration-500">
+      <div className="flex justify-between items-center"><h2 className="text-3xl font-black text-white uppercase tracking-tight">Fault History</h2><div className="flex bg-white/5 p-1 rounded-lg border border-white/10"><Search size={16} className="text-text-muted mt-2 ml-2" /><input type="text" value={searchTerm} onChange={e => setSearchTerm(e.target.value)} placeholder="Search records..." className="bg-transparent border-none outline-none px-4 py-2 text-sm text-white w-64" /></div></div>
+      <div className="glass-card p-4 flex gap-3 items-center">
+        <Filter size={16} className="text-text-muted" />
+        <select value={ispFilter} onChange={e => setIspFilter(e.target.value)} className="bg-[#1e293b]/50 border border-white/10 rounded-lg p-2 text-xs text-white outline-none"><option value="all">All ISPs</option>{uniqueIsps.map(isp => <option key={isp} value={isp}>{isp}</option>)}</select>
+        <select value={severityFilter} onChange={e => setSeverityFilter(e.target.value)} className="bg-[#1e293b]/50 border border-white/10 rounded-lg p-2 text-xs text-white outline-none"><option value="all">All Severities</option><option value="Critical">Critical</option><option value="Major">Major</option><option value="Minor">Minor</option></select>
+        <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)} className="bg-[#1e293b]/50 border border-white/10 rounded-lg p-2 text-xs text-white outline-none"><option value="all">All Statuses</option>{STATUS_OPTIONS.map(s => <option key={s} value={s}>{s}</option>)}</select>
+        <select value={locationFilter} onChange={e => setLocationFilter(e.target.value)} className="bg-[#1e293b]/50 border border-white/10 rounded-lg p-2 text-xs text-white outline-none"><option value="all">All Locations</option>{uniqueLocations.map(loc => <option key={loc} value={loc}>{loc}</option>)}</select>
+      </div>
+      <div className="glass-card overflow-hidden">
+        {filteredLogs.length === 0 ? (
+          <div className="p-12 text-center text-text-muted text-sm font-bold">No fault records match the current filters.</div>
+        ) : (
+          <table className="w-full text-left">
+            <thead><tr className="bg-white/5 text-[10px] text-text-muted uppercase tracking-widest"><th className="px-6 py-4">Ticket</th><th className="px-6 py-4">Provider</th><th className="px-6 py-4">Fault Type</th><th className="px-6 py-4">Status</th><th className="px-6 py-4">Assigned</th><th className="px-6 py-4">Duration</th><th className="px-6 py-4 text-right">Actions</th></tr></thead>
+            <tbody className="divide-y divide-white/5">{filteredLogs.map(log => (<tr key={log.id} className="hover:bg-white/5 transition-colors cursor-pointer" onClick={() => setViewingLog(log)}><td className="px-6 py-4 text-xs font-mono text-accent-gold">{log.ticket_number || `#${log.id}`}</td><td className="px-6 py-4"><div className="flex items-center gap-3">{log.attachment_path && (<div className="w-8 h-8 rounded-lg overflow-hidden border border-white/10 shrink-0"><img src={`/api/${log.attachment_path}`} className="w-full h-full object-cover" alt="Log" /></div>)}<span className="font-bold">{log.isp_name}</span></div></td><td className="px-6 py-4 text-sm">{log.fault_type}</td><td className="px-6 py-4"><span className={`text-[10px] font-bold px-3 py-1 rounded-full ${getStatusClass(log.status)}`}>{log.status}</span></td><td className="px-6 py-4 text-xs text-text-muted">{log.assigned_to || 'Unassigned'}</td><td className="px-6 py-4 text-xs text-text-muted">{formatDuration(log.created_at, log.resolved_at || log.closed_at)}</td><td className="px-6 py-4 text-right"><div className="flex items-center justify-end gap-3"><Eye size={16} className="text-text-muted hover:text-white cursor-pointer" onClick={(e) => { e.stopPropagation(); setViewingLog(log); }} /><Trash2 size={16} className="text-text-muted hover:text-accent-red cursor-pointer" onClick={(e) => { e.stopPropagation(); setSelectedLogId(log.id); setShowDeleteModal(true); }} /></div></td></tr>))}</tbody>
+          </table>
+        )}
+      </div>
     </div>
-  </div>
-);
+  );
+};
 
-const FaultLogsView = ({ logs, formatDate, setSelectedLogId, setShowDeleteModal, setActiveTab }) => {
+const FaultLogsViewLegacy = ({ logs, formatDate, setSelectedLogId, setShowDeleteModal, setActiveTab }) => {
   const [viewingLog, setViewingLog] = useState(null);
 
   if (viewingLog) {
@@ -1026,7 +1522,8 @@ const LogIncidentView = ({
   handleSubmit, 
   setActiveTab,
   submitError,
-  isLoading
+  isLoading,
+  assignees
 }) => (
   <div className="max-w-4xl mx-auto animate-in zoom-in duration-500 pb-20">
     <div className="flex flex-col gap-8">
@@ -1075,6 +1572,21 @@ const LogIncidentView = ({
                   </select>
                   <ChevronDown size={16} className="absolute right-4 top-1/2 -translate-y-1/2 text-text-muted pointer-events-none" />
                 </div>
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              <label className="text-[11px] font-black uppercase tracking-[0.2em] text-[#94a3b8] ml-1">Assign Engineer</label>
+              <div className="relative">
+                <select
+                  value={newFault.assigned_to}
+                  onChange={e => setNewFault({ ...newFault, assigned_to: e.target.value })}
+                  className="w-full bg-[#1e293b]/50 border border-white/10 rounded-2xl p-4 text-sm text-white focus:border-accent-gold outline-none transition-all appearance-none font-bold"
+                >
+                  <option value="" className="bg-[#0f172a]">Unassigned</option>
+                  {assignees.map(a => <option key={a.id} value={a.username} className="bg-[#0f172a]">{a.username}</option>)}
+                </select>
+                <ChevronDown size={16} className="absolute right-4 top-1/2 -translate-y-1/2 text-text-muted pointer-events-none" />
               </div>
             </div>
 
@@ -1151,17 +1663,24 @@ const LogIncidentView = ({
               <div className="relative group overflow-hidden rounded-2xl">
                 <input 
                   type="file" 
+                  accept="image/png,image/jpeg,image/webp,application/pdf"
                   onChange={handleImageChange}
                   className="absolute inset-0 opacity-0 cursor-pointer z-20"
                 />
                 <div className={`p-10 border-2 border-dashed rounded-2xl flex flex-col items-center justify-center gap-4 transition-all duration-300 ${
                   selectedImage ? 'border-accent-teal bg-accent-teal/10' : 'border-white/10 bg-white/5 group-hover:border-accent-gold/50 group-hover:bg-accent-gold/5'
                 }`}>
-                  {imagePreview ? (
+                  {selectedImage ? (
                     <div className="flex flex-col items-center gap-3">
-                      <div className="w-20 h-20 rounded-xl overflow-hidden border-2 border-accent-teal shadow-xl">
-                        <img src={imagePreview} className="w-full h-full object-cover" alt="Preview" />
-                      </div>
+                      {imagePreview ? (
+                        <div className="w-20 h-20 rounded-xl overflow-hidden border-2 border-accent-teal shadow-xl">
+                          <img src={imagePreview} className="w-full h-full object-cover" alt="Preview" />
+                        </div>
+                      ) : (
+                        <div className="w-20 h-20 rounded-xl border-2 border-accent-teal shadow-xl flex items-center justify-center bg-white/5">
+                          <FileText className="text-accent-teal" size={28} />
+                        </div>
+                      )}
                       <p className="text-[11px] font-black uppercase tracking-widest text-accent-teal">File Attached</p>
                     </div>
                   ) : (
@@ -1171,7 +1690,7 @@ const LogIncidentView = ({
                       </div>
                       <div className="text-center">
                         <p className="text-[11px] font-black uppercase tracking-widest text-white mb-1">Click to Upload</p>
-                        <p className="text-[10px] font-bold text-text-muted">PNG, JPG up to 10MB</p>
+                        <p className="text-[10px] font-bold text-text-muted">PNG, JPG, WEBP, PDF up to 10MB</p>
                       </div>
                     </>
                   )}
@@ -1205,6 +1724,92 @@ const LogIncidentView = ({
     </div>
   </div>
 );
+
+const UsersView = ({ token, logout }) => {
+  const [users, setUsers] = useState([]);
+  const [form, setForm] = useState({ username: '', email: '', password: '', role: 'Engineer' });
+  const [resetPasswords, setResetPasswords] = useState({});
+  const [message, setMessage] = useState('');
+
+  const loadUsers = async () => {
+    const res = await fetch('/api/users/', { headers: { 'Authorization': `Bearer ${token}` } });
+    if (res.status === 401) return logout();
+    if (res.ok) setUsers(await res.json());
+  };
+
+  useEffect(() => { loadUsers(); }, [token]);
+
+  const createUser = async () => {
+    setMessage('');
+    const res = await fetch('/api/users/', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      body: JSON.stringify(form)
+    });
+    if (res.status === 401) return logout();
+    if (res.ok) {
+      setForm({ username: '', email: '', password: '', role: 'Engineer' });
+      setMessage('User created.');
+      loadUsers();
+    } else {
+      const data = await res.json().catch(() => ({}));
+      setMessage(data.detail || 'Failed to create user.');
+    }
+  };
+
+  const updateUser = async (id, payload) => {
+    setMessage('');
+    const res = await fetch(`/api/users/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      body: JSON.stringify(payload)
+    });
+    if (res.status === 401) return logout();
+    if (res.ok) {
+      setMessage('User updated.');
+      loadUsers();
+    } else {
+      const data = await res.json().catch(() => ({}));
+      setMessage(data.detail || 'Failed to update user.');
+    }
+  };
+
+  return (
+    <div className="space-y-8 animate-in fade-in duration-500">
+      <div>
+        <h2 className="text-3xl font-black text-white uppercase tracking-tight">User Management</h2>
+        <p className="text-xs text-text-muted mt-1">Create accounts, assign roles, and reset passwords</p>
+      </div>
+
+      <div className="glass-card p-8 space-y-4 border-t-4 border-t-accent-gold">
+        <div className="flex items-center gap-3 mb-2"><UserPlus className="text-accent-gold" size={20} /><h3 className="text-xl font-bold text-white uppercase tracking-tight">Create User</h3></div>
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+          <input value={form.username} onChange={e => setForm({ ...form, username: e.target.value })} placeholder="Username" className="bg-[#1e293b]/50 border border-white/10 rounded-lg p-3 text-sm text-white outline-none" />
+          <input value={form.email} onChange={e => setForm({ ...form, email: e.target.value })} placeholder="Email" className="bg-[#1e293b]/50 border border-white/10 rounded-lg p-3 text-sm text-white outline-none" />
+          <input type="password" value={form.password} onChange={e => setForm({ ...form, password: e.target.value })} placeholder="Password" className="bg-[#1e293b]/50 border border-white/10 rounded-lg p-3 text-sm text-white outline-none" />
+          <select value={form.role} onChange={e => setForm({ ...form, role: e.target.value })} className="bg-[#1e293b]/50 border border-white/10 rounded-lg p-3 text-sm text-white outline-none"><option>Engineer</option><option>Viewer</option><option>Admin</option></select>
+        </div>
+        <button onClick={createUser} className="premium-button py-3 px-6 text-xs">CREATE USER</button>
+        {message && <p className="text-xs font-bold text-accent-gold">{message}</p>}
+      </div>
+
+      <div className="glass-card overflow-hidden">
+        <table className="w-full text-left">
+          <thead><tr className="bg-white/5 text-[10px] text-text-muted uppercase tracking-widest"><th className="px-6 py-4">Username</th><th className="px-6 py-4">Email</th><th className="px-6 py-4">Role</th><th className="px-6 py-4">Reset Password</th><th className="px-6 py-4 text-right">Action</th></tr></thead>
+          <tbody className="divide-y divide-white/5">{users.map(u => (
+            <tr key={u.id} className="hover:bg-white/5 transition-colors">
+              <td className="px-6 py-4 font-bold text-white">{u.username}</td>
+              <td className="px-6 py-4 text-sm text-text-muted">{u.email}</td>
+              <td className="px-6 py-4"><select value={u.role} onChange={e => updateUser(u.id, { role: e.target.value })} className="bg-[#1e293b]/50 border border-white/10 rounded-lg p-2 text-xs text-white outline-none"><option>Admin</option><option>Engineer</option><option>Viewer</option></select></td>
+              <td className="px-6 py-4"><input type="password" value={resetPasswords[u.id] || ''} onChange={e => setResetPasswords({ ...resetPasswords, [u.id]: e.target.value })} placeholder="New password" className="bg-[#1e293b]/50 border border-white/10 rounded-lg p-2 text-xs text-white outline-none" /></td>
+              <td className="px-6 py-4 text-right"><button onClick={() => updateUser(u.id, { password: resetPasswords[u.id] })} className="bg-white/5 hover:bg-white/10 text-white px-4 py-2 rounded-lg text-[10px] font-black uppercase tracking-widest">Reset</button></td>
+            </tr>
+          ))}</tbody>
+        </table>
+      </div>
+    </div>
+  );
+};
 
 const ReportsView = () => (
   <div className="space-y-8 animate-in fade-in duration-500">
@@ -1307,15 +1912,23 @@ const SpeedTestView = ({ token, logout }) => {
       )}
 
       {!results && !isRunning && (
-        <div className="glass-card p-24 flex flex-col items-center justify-center text-center gap-8 border-dashed border-2 border-white/10">
-          <div className="w-28 h-28 bg-white/5 rounded-full flex items-center justify-center text-white/10 group-hover:text-white/20 transition-all">
+        <div className="glass-card p-20 flex flex-col items-center justify-center text-center gap-8 border-2 border-accent-gold/20">
+          <div className="w-28 h-28 bg-accent-gold/10 rounded-full flex items-center justify-center text-accent-gold animate-pulse">
             <Zap size={56} />
           </div>
           <div className="space-y-2">
-            <h3 className="text-xl font-bold text-white uppercase tracking-tight">Ready to Benchmark</h3>
+            <h3 className="text-xl font-bold text-white uppercase tracking-tight">Network Performance Test Ready</h3>
             <p className="text-text-muted max-w-sm mx-auto text-sm leading-relaxed">
-              Click the button above to measure your current bandwidth. This will check download, upload, and server latency.
+              Run a live diagnostic to measure download, upload, and latency for the current gateway.
             </p>
+          </div>
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 w-full max-w-sm">
+            {['Download', 'Upload', 'Ping'].map(label => (
+              <div key={label} className="network-stat-card bg-white/5 border border-white/10 rounded-xl p-4">
+                <p className="network-stat-label text-[10px] font-black text-text-muted uppercase tracking-widest">{label}</p>
+                <p className="text-lg font-black text-white mt-2">--</p>
+              </div>
+            ))}
           </div>
         </div>
       )}

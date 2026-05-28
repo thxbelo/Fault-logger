@@ -9,6 +9,9 @@ SQLALCHEMY_DATABASE_URL = os.getenv(
     "sqlite:///./bcc_nims.db"
 )
 
+if SQLALCHEMY_DATABASE_URL.startswith("postgresql://"):
+    SQLALCHEMY_DATABASE_URL = SQLALCHEMY_DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+
 # SQLite needs 'check_same_thread': False
 connect_args = {"check_same_thread": False} if SQLALCHEMY_DATABASE_URL.startswith("sqlite") else {}
 

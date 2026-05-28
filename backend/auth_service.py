@@ -3,9 +3,12 @@ from typing import Optional
 from jose import JWTError, jwt
 import bcrypt
 import os
+import secrets
 
-# In a real production app, use secret environment variables
-SECRET_KEY = os.getenv("SECRET_KEY", "7d4a2d398d2345e2a9f5c4b1a2e3d4f5g6h7j8k9")
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    SECRET_KEY = secrets.token_urlsafe(48)
+    print("WARNING: SECRET_KEY is not set. Using an ephemeral development secret for this process.")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 # 1 day
 
