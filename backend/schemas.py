@@ -79,3 +79,10 @@ class NotificationRuleOut(NotificationRuleBase):
 
     class Config:
         from_attributes = True
+
+class SpeedTestResult(BaseModel):
+    download: float
+    upload: float
+    ping: float
+    server: str
+    timestamp: datetime

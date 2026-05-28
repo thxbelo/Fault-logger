@@ -28,6 +28,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.on_event("startup")
+def startup_event():
+    db = next(database.get_db())
+    try:
+        # Create default admin if not exists
+        admin = db.query(models.User).filter(models.User.username == "admin").first()
+        if not admin:
+            hashed_pwd = auth_service.get_password_hash("admin123")
+            new_admin = models.User(
+                username="admin", 
+                email="admin@bcc.gov.zw", 
+                password_hash=hashed_pwd, 
+                role="Admin"
+            )
+            db.add(new_admin)
+            db.commit()
+            print("Default admin user created: admin / admin123")
+    except Exception as e:
+        print(f"Error during startup: {e}")
+    finally:
+        db.close()
+
 # Static Files
 if not os.path.exists("uploads"):
     os.makedirs("uploads")
@@ -56,19 +78,19 @@ manager = ConnectionManager()
 
 # Dependency
 async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(database.get_db)):
-    from jose import JWTError, jwt
     credentials_exception = HTTPException(
         status_code=401,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
-        payload = jwt.decode(token, auth_service.SECRET_KEY, algorithms=[auth_service.ALGORITHM])
+        payload = auth_service.jwt.decode(token, auth_service.SECRET_KEY, algorithms=[auth_service.ALGORITHM])
         username: str = payload.get("sub")
         if username is None:
             raise credentials_exception
-    except JWTError:
+    except auth_service.JWTError:
         raise credentials_exception
+        
     user = db.query(models.User).filter(models.User.username == username).first()
     if user is None:
         raise credentials_exception
@@ -77,7 +99,13 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
 # Auth Routes
 @app.post("/token", response_model=schemas.Token)
 def login_for_access_token(db: Session = Depends(database.get_db), form_data: OAuth2PasswordRequestForm = Depends()):
+    print(f"Login attempt for user: {form_data.username}")
     user = db.query(models.User).filter(models.User.username == form_data.username).first()
+    if not user:
+        print(f"User {form_data.username} not found in database.")
+    elif not auth_service.verify_password(form_data.password, user.password_hash):
+        print(f"Password mismatch for user {form_data.username}.")
+    
     if not user or not auth_service.verify_password(form_data.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Incorrect username or password")
     access_token = auth_service.create_access_token(data={"sub": user.username})
@@ -225,7 +253,8 @@ async def create_fault(
 @app.get("/faults/", response_model=List[schemas.FaultLog])
 def read_faults(
     period: str = Query("all", enum=["day", "week", "month", "all"]),
-    db: Session = Depends(database.get_db)
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(get_current_user)
 ):
     query = db.query(models.FaultLog)
     
@@ -245,7 +274,8 @@ def read_faults(
 async def update_fault(
     fault_id: int, 
     update_data: schemas.FaultLogUpdate, 
-    db: Session = Depends(database.get_db)
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(get_current_user)
 ):
     db_fault = db.query(models.FaultLog).filter(models.FaultLog.id == fault_id).first()
     if not db_fault:
@@ -293,7 +323,8 @@ async def delete_fault(
 async def upload_document(
     fault_id: int, 
     file: UploadFile = File(...), 
-    db: Session = Depends(database.get_db)
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(get_current_user)
 ):
     db_fault = db.query(models.FaultLog).filter(models.FaultLog.id == fault_id).first()
     if not db_fault:
@@ -303,17 +334,19 @@ async def upload_document(
     if not os.path.exists(upload_dir):
         os.makedirs(upload_dir)
         
-    file_path = os.path.join(upload_dir, f"{fault_id}_{file.filename}")
+    safe_filename = file.filename.split("/")[-1].split("\\")[-1] # basic path traversal protection
+    file_path = os.path.join(upload_dir, f"{fault_id}_{safe_filename}")
+    
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
         
-    db_fault.attachment_path = file_path
+    db_fault.attachment_path = f"uploads/{fault_id}_{safe_filename}"
     db.commit()
-    return {"filename": file.filename, "path": file_path}
+    return {"filename": safe_filename, "path": db_fault.attachment_path}
 
 # Reporting & Stats
 @app.get("/stats/", response_model=schemas.StatsSummary)
-def get_stats(db: Session = Depends(database.get_db)):
+def get_stats(db: Session = Depends(database.get_db), current_user: models.User = Depends(get_current_user)):
     total = db.query(models.FaultLog).count()
     open_count = db.query(models.FaultLog).filter(models.FaultLog.status == "Open").count()
     today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -340,17 +373,41 @@ def get_stats(db: Session = Depends(database.get_db)):
 
 # Export System (Enhanced)
 @app.get("/export/{format}")
-def export_logs(format: str, period: str = "all", db: Session = Depends(database.get_db)):
-    logs_data = read_faults(period=period, db=db)
+def export_logs(format: str, period: str = "all", db: Session = Depends(database.get_db), current_user: models.User = Depends(get_current_user)):
+    logs_data = read_faults(period=period, db=db, current_user=current_user)
     if format == "xlsx":
         df = pd.DataFrame([{
             "ID": l.id, "ISP": l.isp_name, "Location": l.location, 
             "Type": l.fault_type, "Severity": l.severity, "Status": l.status,
-            "Created": l.created_at, "Resolved": l.resolved_at, "SLA Breach": l.is_sla_breach
+            "Date": l.created_at.strftime("%Y-%m-%d") if l.created_at else "",
+            "Time Created": l.created_at.strftime("%H:%M") if l.created_at else "",
+            "Time Resolved": l.resolved_at.strftime("%H:%M") if l.resolved_at else "",
+            "SLA Breach": l.is_sla_breach
         } for l in logs_data])
         output = BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df.to_excel(writer, index=False, sheet_name='Faults')
+            
+            # Apply styling
+            workbook = writer.book
+            worksheet = writer.sheets['Faults']
+            
+            from openpyxl.styles import PatternFill
+            fill_yellow = PatternFill(start_color='FFFFFF00', end_color='FFFFFF00', fill_type='solid')
+            fill_green = PatternFill(start_color='FF92D050', end_color='FF92D050', fill_type='solid') # Soft Green
+            fill_red = PatternFill(start_color='FFFF6666', end_color='FFFF6666', fill_type='solid') # Soft Red to keep text visible
+            
+            headers = [cell.value for cell in worksheet[1]]
+            col_date = headers.index("Date") + 1 if "Date" in headers else None
+            col_created = headers.index("Time Created") + 1 if "Time Created" in headers else None
+            col_resolved = headers.index("Time Resolved") + 1 if "Time Resolved" in headers else None
+            
+            for row_idx, row in enumerate(worksheet.iter_rows(min_row=1, max_row=worksheet.max_row)):
+                if row_idx == 0: continue # Skip header
+                if col_date: row[col_date-1].fill = fill_yellow
+                if col_created: row[col_created-1].fill = fill_green
+                if col_resolved: row[col_resolved-1].fill = fill_red
+
         output.seek(0)
         return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": "attachment; filename=report.xlsx"})
     
@@ -394,6 +451,34 @@ def _build_chart_data(db: Session) -> dict:
 @app.get("/chart-data/")
 def get_chart_data(db: Session = Depends(database.get_db)):
     return _build_chart_data(db)
+
+# Speed Test
+@app.get("/speedtest", response_model=schemas.SpeedTestResult)
+async def run_speedtest(current_user: models.User = Depends(get_current_user)):
+    """Run a live internet speed test."""
+    import speedtest
+    
+    def _test():
+        st = speedtest.Speedtest()
+        st.get_best_server()
+        st.download()
+        st.upload()
+        return st.results.dict()
+
+    loop = asyncio.get_event_loop()
+    try:
+        # Run synchronous speedtest in a separate thread to avoid blocking
+        res = await loop.run_in_executor(None, _test)
+        return {
+            "download": round(res["download"] / 1_000_000, 2),
+            "upload": round(res["upload"] / 1_000_000, 2),
+            "ping": round(res["ping"], 2),
+            "server": f"{res['server']['name']}, {res['server']['country']}",
+            "timestamp": datetime.now()
+        }
+    except Exception as e:
+        print(f"Speedtest failed: {e}")
+        raise HTTPException(status_code=500, detail="Internet speed test failed. Please try again later.")
 
 # WebSockets
 @app.websocket("/ws")
